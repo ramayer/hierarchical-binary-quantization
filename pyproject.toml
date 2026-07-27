@@ -1,0 +1,17 @@
+[project]
+name = "hierarchical-binary-quantization"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Ron M", email = "ramayer+git@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+hierarchical-binary-quantization = "hierarchical_binary_quantization:main"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.12.0"]
+build-backend = "uv_build"
