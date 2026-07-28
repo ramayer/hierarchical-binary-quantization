@@ -4,9 +4,9 @@ Algorithm from GRN / arXiv 2604.13030 (Han et al., 2026)
 """
 
 import torch
-import torch.nn
+import torch.nn as nn
 
-def hbq(z: torch.Tensor, n_rounds:int):
+def hbq(z: torch.Tensor, n_rounds:int): # batches and latents
     quantized = torch.zeros_like(z)
     tokenids = torch.zeros(z.shape,dtype=torch.int,device=z.device)
     for r in range(n_rounds):
