@@ -7,7 +7,9 @@ authors = [
     { name = "Ron M", email = "ramayer+git@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "torch>=2.13.0",
+]
 
 [project.scripts]
 hierarchical-binary-quantization = "hierarchical_binary_quantization:main"
