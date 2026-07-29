@@ -1,13 +1,16 @@
 [project]
 name = "hierarchical-binary-quantization"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hierarchical Binary Quantization (HBQ) re-implemented from the GRN (arXiv 2604.13030) paper"
 readme = "README.md"
 authors = [
     { name = "Ron M", email = "ramayer+git@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "beartype>=0.19.0",
+    "einx>=0.4.3",
+    "jaxtyping>=0.2.36",
     "lpips>=0.1.4",
     "matplotlib>=3.11.1",
     "numpy>=2.5.1",

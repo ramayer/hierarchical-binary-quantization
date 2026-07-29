@@ -2,7 +2,22 @@
     Thx, claude for writing an example quantizing autoencoder
 """
 import torch
-from torch import nn
+from torch import nn, Tensor
+from jaxtyping import Float, Int, jaxtyped
+from beartype import beartype
+from dataclasses import dataclass
+
+@dataclass
+class AutoencoderResults:
+    latents: Tensor
+
+@dataclass
+class QuantizingAutoencoderResults:
+    latents: Tensor
+    quantized_latents: Tensor
+    bit_codes: Tensor
+    tokens: Tensor
+
 
 def _gn(channels:int) -> nn.GroupNorm:
     num_groups = 8
@@ -87,34 +102,51 @@ class ExampleAutoencoder(nn.Module):
             GroupNormResBlock(base_dim),
             GroupNormResBlock(base_dim),
             nn.Conv2d(base_dim, in_channels, kernel_size=3, padding=1),
-            nn.Sigmoid()
+            nn.Tanh()
         )
-    def encode(self, images: torch.Tensor) -> torch.Tensor:
+    @jaxtyped(typechecker=beartype)
+    def encode(self, images: Float[Tensor, "B C H W"]) -> Float[Tensor, "B L LH LW"]:
         x = self.enc_stem(images)
         x = self.enc_down1(x)
         x = self.enc_down2(x)
         x = self.enc_bottleneck(x)
         return x
-    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+    @jaxtyped(typechecker=beartype)
+    def decode(self, latents: Float[Tensor, "B L LH LW"]) -> Float[Tensor, "B C H W"]:
         x = self.dec_bottleneck(latents)
         x = self.dec_up1(x)
         x = self.dec_up2(x)
         x = self.dec_out(x)
         return x
-    def forward(self, images: torch.tensor) -> tuple[torch.Tensor,torch.Tensor]:
+    def forward(self, images: Float[Tensor, "B C H W"]) -> tuple[torch.Tensor,AutoencoderResults]:
         latents = self.encode(images)
         reconstructions = self.decode(latents)
-        return reconstructions,latents
+        return reconstructions,AutoencoderResults(latents=latents)
 
 from .hbq import HBQQuantizer
 class ExampleQuantizingAutoencoder(nn.Module):
-    def __init__(self,in_channels: int=3, latent_dim: int=256, base_dim:int=64):
+    def __init__(self,in_channels: int=3, latent_dim: int=256, base_dim:int=64, quant_dim:int=8, n_rounds:int=4):
         super().__init__()
         self.backbone = ExampleAutoencoder(in_channels,latent_dim,base_dim)
-        self.quantizer = HBQQuantizer(n_rounds=1)
-    def forward(self, images: torch.tensor) -> tuple[torch.Tensor,torch.Tensor]:
+        self.quantizer = HBQQuantizer(n_rounds=n_rounds)
+        self.pre_quant = nn.Sequential(
+            GroupNormResBlock(latent_dim),
+            nn.Conv2d(latent_dim,quant_dim,kernel_size=1),
+        )
+        self.post_quant = nn.Sequential(
+            nn.Conv2d(quant_dim, latent_dim, kernel_size=1),
+            GroupNormResBlock(latent_dim),
+        )
+        self.quant_dim = quant_dim
+        self.n_rounds = n_rounds
+        self.latent_dim = latent_dim
+        self.base_dim = base_dim
+            
+    @jaxtyped(typechecker=beartype)
+    def forward(self, images: Float[Tensor,"B C H W"]) -> tuple[torch.Tensor,QuantizingAutoencoderResults]:
         latents = self.backbone.encode(images)
-        q_out, token_ids = self.quantizer(latents)
-        reconstructions = self.backbone.decode(q_out)
-        return reconstructions,latents, q_out, token_ids
-
+        z = self.pre_quant(latents)
+        q_out, q_aux = self.quantizer(z)
+        z = self.post_quant(q_out)
+        reconstructions = self.backbone.decode(z)
+        return reconstructions,QuantizingAutoencoderResults(latents=latents, quantized_latents = q_out, bit_codes = q_aux.bit_codes, tokens = q_aux.tokens)
