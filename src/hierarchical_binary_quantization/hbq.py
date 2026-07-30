@@ -28,7 +28,7 @@ def bit_codes_to_tokens(
     latent_dim = bit_codes.shape[-1]
     total_bits = latent_dim * n_rounds
     if total_bits > 63:
-        print("Warning: large vocab doesn't lend itself to use as tokens.")
+        #print("Warning: large vocab doesn't lend itself to use as tokens.")
         return None
     shifts = torch.arange(latent_dim, device=bit_codes.device,dtype=torch.long) * n_rounds
     result = (bit_codes << shifts).sum(dim=-1)
