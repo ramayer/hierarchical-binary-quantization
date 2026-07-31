@@ -1,2 +1,4 @@
 __pycache__
 uv.lock
+.ipynb_checkpoints/
+checkpoints/
