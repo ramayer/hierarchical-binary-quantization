@@ -2,3 +2,6 @@
 
 The quantizer in the GRN paper is useful outside of GRN, so I re-implemented it as a separate module.
 
+TODO:
+
+* Apply this https://arxiv.org/pdf/2511.13720, to the HBQ latent space.
