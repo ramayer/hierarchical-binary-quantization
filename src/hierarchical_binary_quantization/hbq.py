@@ -3,11 +3,14 @@
 Algorithm from GRN / arXiv 2604.13030 (Han et al., 2026)
 """
 
+import einx
+import random
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int, jaxtyped
 from beartype import beartype
 from torch import Tensor
+from dataclasses import dataclass
 
 @jaxtyped(typechecker=beartype)
 def hbq(z: Float[Tensor,"*shape"], n_rounds:int) -> tuple[Float[Tensor,"*shape"],Int[Tensor,"*shape"]]:
@@ -54,24 +57,33 @@ def bit_codes_to_quantized_latent(bit_codes: Int[Tensor,"*B latent_dim"], n_roun
         q = q + torch.where(high, interval, -interval)
     return q
 
-from dataclasses import dataclass
 @dataclass
 class QuantizerAuxOutputs:
+    quantized: Float[Tensor, "*B L"]
     bit_codes: Int[Tensor,"*B L"]
     tokens: Int[Tensor,"*B"]|None
+    n_rounds: int
 
-import einx
 class HBQQuantizer(nn.Module):
     def __init__(self, n_rounds:int):
         super().__init__()
         self.n_rounds = n_rounds
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, x:Float[Tensor,"*B"])-> tuple[Float[Tensor,"*B"],QuantizerAuxOutputs]:
-        tx = torch.tanh(x)
+    def forward(self, tx:Float[Tensor,"*B"]) -> tuple[Float[Tensor,"*B"],QuantizerAuxOutputs]:
         q,bit_codes = hbq(tx, self.n_rounds)
         q_with_grad = tx + (q - tx).detach()
-        tokens = bit_codes_to_tokens(einx.id("B L H W -> B H W L",bit_codes),self.n_rounds)
-        return q_with_grad, QuantizerAuxOutputs(bit_codes,tokens)
+        tokens = bit_codes_to_tokens(einx.id("B L H W -> B H W L",bit_codes),self.n_rounds) # type: ignore
+        return q_with_grad, QuantizerAuxOutputs(q, bit_codes, tokens, self.n_rounds)
+
+class QuantizerRandomizer(nn.Module):
+    def __init__(self, quantizers: list[nn.Module]):
+        super().__init__()
+        self.quantizers = nn.ModuleList(quantizers)
+    def forward(self, x: Float[Tensor,"*B"]) -> tuple[Float[Tensor,"*B"],QuantizerAuxOutputs]:
+        q = self.quantizers[random.randrange(len(self.quantizers))]
+        return q(x)
+
+
 
 

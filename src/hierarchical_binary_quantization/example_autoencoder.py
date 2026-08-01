@@ -10,14 +10,7 @@ from dataclasses import dataclass
 @dataclass
 class AutoencoderResults:
     latents: Tensor
-
-@dataclass
-class QuantizingAutoencoderResults:
-    latents: Tensor
-    quantized_latents: Tensor
-    bit_codes: Tensor
-    tokens: Tensor | None
-
+    quant_info: object = None # Type depends on the optional encoder.
 
 def _gn(channels:int) -> nn.GroupNorm:
     num_groups = 8
@@ -46,7 +39,7 @@ class ExampleAutoencoder(nn.Module):
             in_channels:int=3, 
             base_dim:int=64,
             channel_multipliers: tuple[int,...] = (1,2,4,4),
-            latent_dim:int=256, 
+            latent_dim:int=16, 
             res_blocks: int=2,
             ):
         super().__init__()
@@ -80,7 +73,7 @@ class ExampleAutoencoder(nn.Module):
         dec += [
             *[GroupNormResBlock(dims[0]) for _ in range(res_blocks)],
             nn.Conv2d(dims[0],in_channels, kernel_size=3, padding=1),
-            nn.Tanh()
+            nn.Tanh(),
         ]
         self.decoder = nn.Sequential(*dec)
     
@@ -102,16 +95,20 @@ from .hbq import HBQQuantizer
 @dataclass 
 class HBQAutoencoderConfig:
     in_channels: int=3
-    base_dim: int=128
+    base_dim: int=64
     channel_multipliers: tuple[int, ...] = (1,2,4,4)
-    latent_dim: int=16
+    latent_dim: int=32
     quant_dim: int=16
     n_rounds: int=4
     res_blocks: int=2
 
 class ExampleQuantizingAutoencoder(nn.Module):
-    def __init__(self,conf:HBQAutoencoderConfig | None=None, **kwargs):
+    def __init__(self,
+                 conf:HBQAutoencoderConfig | dict | None = None, 
+                 quantizer:nn.Module | None = None,
+                 **kwargs):
         super().__init__()
+        
         if conf is None:
             conf = HBQAutoencoderConfig(**kwargs)
         self.config = conf
@@ -119,11 +116,12 @@ class ExampleQuantizingAutoencoder(nn.Module):
         self.backbone = ExampleAutoencoder(
             conf.in_channels,conf.base_dim,conf.channel_multipliers, conf.latent_dim, conf.res_blocks)
 
-        self.quantizer = HBQQuantizer(n_rounds=conf.n_rounds)
+        self.quantizer = quantizer or HBQQuantizer(n_rounds=conf.n_rounds)
 
         self.pre_quant = nn.Sequential(
             GroupNormResBlock(conf.latent_dim),
             nn.Conv2d(conf.latent_dim,conf.quant_dim,kernel_size=1),
+            nn.Tanh(),
         )
         self.post_quant = nn.Sequential(
             nn.Conv2d(conf.quant_dim, conf.latent_dim, kernel_size=1),
@@ -131,10 +129,10 @@ class ExampleQuantizingAutoencoder(nn.Module):
         )
             
     @jaxtyped(typechecker=beartype)
-    def forward(self, images: Float[Tensor,"B C H W"]) -> tuple[torch.Tensor,QuantizingAutoencoderResults]:
+    def forward(self, images: Float[Tensor,"B C H W"]) -> tuple[torch.Tensor,AutoencoderResults]:
         latents = self.backbone.encode(images)
         z = self.pre_quant(latents)
         q_out, q_aux = self.quantizer(z)
         z = self.post_quant(q_out)
         reconstructions = self.backbone.decode(z)
-        return reconstructions,QuantizingAutoencoderResults(latents=latents, quantized_latents = q_out, bit_codes = q_aux.bit_codes, tokens = q_aux.tokens)
+        return reconstructions,AutoencoderResults(latents=latents, quant_info=q_aux)
