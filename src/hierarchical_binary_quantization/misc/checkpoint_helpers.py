@@ -38,11 +38,12 @@ def save_checkpoint(path, model, optimizer, tag="", metadata = {}):
     print(f"✅ Saved checkpoint: {path}")
     return path
 
-def check_checkpoint(model, optimizer, path, map_location=None, strict=True):
-    checkpoint = torch.load(path, map_location=map_location or "cpu")
+def check_checkpoint(path):
+    checkpoint = torch.load(path, "cpu")
     print(f"🔄 Loading checkpoint from {path}")
-    print(f"    Model class: {checkpoint.get('model_class', '?')}")
-    print(checkpoint["config"])
+    print(f"    Model class: {checkpoint.get('model_class', 'Missing model class')}")
+    print(checkpoint.get("config","Missing config"))
+    return checkpoint
     
 def load_checkpoint(model, optimizer, path, map_location=None, strict=True):
     checkpoint = torch.load(path, map_location=map_location or "cpu")
