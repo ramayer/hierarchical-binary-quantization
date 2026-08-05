@@ -85,6 +85,7 @@ def q_out_to_rgb(q_out):
         rgb -= rgb.min(axis=0, keepdims=True)
         rgb /= rgb.max(axis=0, keepdims=True) + 1e-8
         rgb = torch.from_numpy(rgb.reshape(H, W, 3)).float()
+        rgb = rgb * 2 - 1
         rgb_images.append(rgb)
     return torch.stack(rgb_images)
 
