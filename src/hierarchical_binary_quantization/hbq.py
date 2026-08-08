@@ -80,10 +80,9 @@ class QuantizerRandomizer(nn.Module):
     def __init__(self, quantizers: list[nn.Module]):
         super().__init__()
         self.quantizers = nn.ModuleList(quantizers)
+
     def forward(self, x: Float[Tensor,"*B"]) -> tuple[Float[Tensor,"*B"],QuantizerAuxOutputs]:
-        q = self.quantizers[random.randrange(len(self.quantizers))]
+        idx = torch.randint(len(self.quantizers), (1,)).item()
+        q = self.quantizers[idx]
         return q(x)
-
-
-
 

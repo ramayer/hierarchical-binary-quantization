@@ -237,3 +237,33 @@ class TwoImageDebugDataset(Dataset):
         lr = self.lr_images[which]
         orig = hr.clone()  # unused for training; arbitrary resolution field
         return hr, lr, orig
+
+
+def show_transform_effect(loader,n_images=1, n_augs=4, seed=None):
+    """
+     usage: show_transform_effect(train_loader)
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+        import random
+        random.seed(seed)
+    dataset = loader.dataset
+    transform = dataset.transform
+    idxs=torch.randperm(len(dataset))[:n_images].tolist()
+    fig,axes = plt.subplots(n_images,n_augs+1,figsize=(4*n_augs+1,4*n_images),squeeze=False)
+    for row,idx in enumerate(idxs):
+        dataset.transform=None
+        orig = dataset[idx]
+        dataset.transform = transform
+        ax=axes[row][0]
+        ax.imshow(orig)
+        w,h = TF.get_image_size(orig)
+        ax.set_title(f"orig {w}x{h}",fontsize=10)
+        ax.axis("off")
+        for col in range(n_augs):
+            aug=transform(orig)
+            ax = axes[row][col+1]
+            ax.imshow(aug.permute(1,2,0)/2+0.5)
+            ax.set_title("aug")
+            ax.axis("off")
+            
