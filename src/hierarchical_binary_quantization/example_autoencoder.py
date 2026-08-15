@@ -144,9 +144,9 @@ class ExampleAutoencoder(nn.Module):
         self,
         in_channels=3,
         base_dim=96,
-        channel_multipliers=(1, 2, 4, 6, 6),
+        channel_multipliers=(1, 2, 3, 4),
         latent_dim=32,
-        res_blocks=(1, 2, 3, 4, 4),
+        res_blocks=(1, 2, 3, 3),
         use_attention=True,
     ):
         super().__init__()
@@ -185,12 +185,11 @@ from .hbq import HBQQuantizer
 class HBQAutoencoderConfig:
     in_channels: int = 3
     base_dim: int = 96
-    channel_multipliers: tuple[int, ...] = (1, 2, 4, 6, 6)
-    res_blocks: tuple[int, ...] = (1, 2, 3, 4, 4)
+    channel_multipliers: tuple[int, ...] = (1, 2, 3, 4)
+    res_blocks: tuple[int, ...] = (1, 2, 3, 3)
     latent_dim: int = 32
-    quant_dim: int = 16
+    quant_dim: int = 8
     n_rounds: int = 4
-
 
 class ExampleQuantizingAutoencoder(nn.Module):
     def __init__(self,
@@ -201,6 +200,8 @@ class ExampleQuantizingAutoencoder(nn.Module):
 
         if conf is None:
             conf = HBQAutoencoderConfig(**kwargs)
+        if isinstance(conf, dict):
+            conf = HBQAutoencoderConfig(**conf)
         self.config = conf
 
         self.backbone = ExampleAutoencoder(
@@ -243,7 +244,7 @@ class ExampleQuantizingAutoencoder(nn.Module):
         return reconstructions, AutoencoderResults(latents=latents, quant_info=q_aux)    
 
 # ---------------------------------------------------------------------------
-# Usage sketch: debug-small vs long-large runs, auto-enable on real OOM
+# Checkpointing usage sketch: debug-small vs long-large runs, auto-enable on real OOM
 # ---------------------------------------------------------------------------
 #
 #   model = ExampleQuantizingAutoencoder(conf)   # checkpointing off by default
