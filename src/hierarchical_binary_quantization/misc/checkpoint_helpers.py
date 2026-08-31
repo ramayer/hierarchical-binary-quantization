@@ -68,7 +68,7 @@ def load_checkpoint(model, optimizer, path, map_location=None, strict=True):
     if optimizer and checkpoint["optimizer_state_dict"]:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         print(f"Warning, convert this legacy checkpoint at {path}")
-    if os.path.exists(f"{path}.optimizer.pth"):
+    if os.path.exists(f"{path}.optimizer.pth") and optimizer is not None:
         ocp = torch.load(f"{path}.optimizer.pth", map_location=map_location or "cpu")
         optimizer.load_state_dict(ocp["optimizer_state_dict"])
     return model, optimizer, checkpoint.get('metadata',{})

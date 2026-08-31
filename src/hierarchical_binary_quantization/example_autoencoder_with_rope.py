@@ -169,11 +169,34 @@ class RoPEMultiheadAttention(nn.Module):
         return self.proj(out)
 
 
-class RoPEAttentionBlock(nn.Module):
-    """Drop-in replacement for the old position-blind AttentionBlock.
+class BottleneckAttention(nn.Module):
+    """The ONE place 'what does full attention at a bottleneck look like' is
+    defined. Used by both the encoder/decoder bottleneck AND the masked-token
+    predictor, so they can't independently drift the way window-only vs
+    global-only did before. Always global (no windowing): at bottleneck token
+    counts, full attention is cheap enough that there's no reason to force a
+    narrow window, and long-range binding (matching a hat's color to boots
+    across the frame) is exactly the job a window would get in the way of.
+    Stacked num_layers deep so the model gets compositional multi-hop reach
+    (A informs B informs C), not just one hop.
+    """
 
-    window_size=None: global attention over the whole H x W grid.
-    window_size=k:    non-overlapping k x k local windows.
+    def __init__(self, c, heads=8, num_layers=2):
+        super().__init__()
+        self.blocks = nn.Sequential(
+            *[RoPEAttentionBlock(c, heads=heads, window_size=None) for _ in range(num_layers)]
+        )
+
+    def forward(self, x):
+        return self.blocks(x)
+
+
+class RoPEAttentionBlock(nn.Module):
+    """window_size=None: global attention over the whole H x W grid.
+    window_size=k:    non-overlapping k x k local windows, for local path/edge
+    continuity (e.g. a tapering sword's slope matching its neighbor) at a
+    higher-resolution stage, where full attention would be more expensive and
+    long-range binding isn't the point.
 
     Grid dims that don't divide evenly by window_size are reflect-padded
     before windowing and cropped back after -- so this works on odd shapes
@@ -219,7 +242,8 @@ class RoPEAttentionBlock(nn.Module):
 
 class Encoder(_StagedTower):
     def __init__(self, in_channels, dims, res_blocks, latent_dim, use_attention,
-                 window_size, bottleneck_heads):
+                 window_size, bottleneck_heads, bottleneck_layers,
+                 use_intermediate_windowed_attention):
         stages = []
         stem = [nn.Conv2d(in_channels, dims[0], 3, padding=1, padding_mode="reflect"),
                 _gn(dims[0]), nn.SiLU(),
@@ -230,14 +254,17 @@ class Encoder(_StagedTower):
             down = [nn.Conv2d(dims[i], dims[i + 1], 4, stride=2, padding=1),
                     _gn(dims[i + 1]), nn.SiLU(),
                     *[ResBlock(dims[i + 1]) for _ in range(res_blocks[i + 1])]]
+            # one stage before the bottleneck: local windowed attention, where
+            # a sword/edge still spans multiple tokens and full attention
+            # would cost more than it needs to at this resolution.
+            if (use_attention and use_intermediate_windowed_attention
+                    and len(dims) >= 3 and i == len(dims) - 3):
+                down.append(RoPEAttentionBlock(dims[i + 1], bottleneck_heads, window_size))
             stages.append(down)
 
         latent_stage = []
         if use_attention:
-            # local pass first (fine-scale path/edge continuity), then global
-            # (long-range attribute matching), each RoPE-aware.
-            latent_stage.append(RoPEAttentionBlock(dims[-1], bottleneck_heads, window_size))
-            latent_stage.append(RoPEAttentionBlock(dims[-1], bottleneck_heads, None))
+            latent_stage.append(BottleneckAttention(dims[-1], bottleneck_heads, bottleneck_layers))
         latent_stage.append(nn.Conv2d(dims[-1], latent_dim, 1))
         stages.append(latent_stage)
 
@@ -246,12 +273,12 @@ class Encoder(_StagedTower):
 
 class Decoder(_StagedTower):
     def __init__(self, in_channels, dims, res_blocks, latent_dim, use_attention,
-                 window_size, bottleneck_heads):
+                 window_size, bottleneck_heads, bottleneck_layers,
+                 use_intermediate_windowed_attention):
         stages = []
         latent_stage = [nn.Conv2d(latent_dim, dims[-1], 1), _gn(dims[-1]), nn.SiLU()]
         if use_attention:
-            latent_stage.append(RoPEAttentionBlock(dims[-1], bottleneck_heads, None))
-            latent_stage.append(RoPEAttentionBlock(dims[-1], bottleneck_heads, window_size))
+            latent_stage.append(BottleneckAttention(dims[-1], bottleneck_heads, bottleneck_layers))
         stages.append(latent_stage)
 
         for i in range(len(dims) - 1, 0, -1):
@@ -259,6 +286,11 @@ class Decoder(_StagedTower):
                   nn.Upsample(scale_factor=2, mode="nearest"),
                   nn.Conv2d(dims[i], dims[i - 1], 3, padding=1, padding_mode="reflect"),
                   _gn(dims[i - 1]), nn.SiLU()]
+            # same channel width + resolution as the encoder's intermediate
+            # windowed block, so the two are genuinely symmetric.
+            if (use_attention and use_intermediate_windowed_attention
+                    and len(dims) >= 3 and i == len(dims) - 1):
+                up.append(RoPEAttentionBlock(dims[i - 1], bottleneck_heads, window_size))
             stages.append(up)
 
         tail = [*[ResBlock(dims[0]) for _ in range(res_blocks[0])],
@@ -287,7 +319,7 @@ class AutoencoderResults:
         return ((self.mae_pred - self.mae_target) ** 2 * mask).sum() / denom
 
 
-class ExampleAutoencoder(nn.Module):
+class ExampleAutoencoderWithRope(nn.Module):
     def __init__(
         self,
         in_channels=3,
@@ -298,15 +330,19 @@ class ExampleAutoencoder(nn.Module):
         use_attention=True,
         window_size=4,
         bottleneck_heads=8,
+        bottleneck_layers=2,
+        use_intermediate_windowed_attention=True,
     ):
         super().__init__()
         dims = [base_dim * m for m in channel_multipliers]
         if isinstance(res_blocks, int):
             res_blocks = (res_blocks,) * len(dims)
         self.encoder = Encoder(in_channels, dims, res_blocks, latent_dim, use_attention,
-                                window_size, bottleneck_heads)
+                                window_size, bottleneck_heads, bottleneck_layers,
+                                use_intermediate_windowed_attention)
         self.decoder = Decoder(in_channels, dims, res_blocks, latent_dim, use_attention,
-                                window_size, bottleneck_heads)
+                                window_size, bottleneck_heads, bottleneck_layers,
+                                use_intermediate_windowed_attention)
 
     def set_grad_checkpointing(self, enable: bool = True):
         self.encoder.set_checkpointing(enable)
@@ -331,23 +367,24 @@ class ExampleAutoencoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MaskedTokenPredictor(nn.Module):
-    def __init__(self, quant_dim, depth=2, heads=2, window_size=None, mask_ratio=0.5):
+    """Same BottleneckAttention as the main model's bottleneck -- deliberately
+    NOT its own independently-configured attention stack. The earlier
+    windowed-only version had no way to reconcile predictions across window
+    boundaries, which is exactly why it checkerboarded at the window grid."""
+
+    def __init__(self, quant_dim, depth=2, heads=2, mask_ratio=0.5):
         super().__init__()
         self.mask_ratio = mask_ratio
         self.mask_token = nn.Parameter(torch.zeros(1, quant_dim, 1, 1))
         nn.init.normal_(self.mask_token, std=0.02)
-        self.blocks = nn.ModuleList(
-            RoPEAttentionBlock(quant_dim, heads=heads, window_size=window_size)
-            for _ in range(depth)
-        )
+        self.blocks = BottleneckAttention(quant_dim, heads=heads, num_layers=depth)
         self.predict = nn.Conv2d(quant_dim, quant_dim, kernel_size=1)
 
     def forward(self, q_out: Tensor, target: Tensor):
         b, c, h, w = q_out.shape
         mask = (torch.rand(b, 1, h, w, device=q_out.device) < self.mask_ratio).float()
         x = q_out * (1 - mask) + self.mask_token * mask
-        for block in self.blocks:
-            x = block(x)
+        x = self.blocks(x)
         pred = self.predict(x)
         return pred, target, mask
 
@@ -366,8 +403,10 @@ class HBQAutoencoderConfig:
     quant_dim: int = 8
     n_rounds: int = 4
     # new, all defaulted so existing call sites keep working unchanged
-    window_size: int = 4
+    window_size: int = 4               # used only by the intermediate windowed stage now
     bottleneck_heads: int = 8
+    bottleneck_layers: int = 2         # stacked global attention layers at the bottleneck
+    use_intermediate_windowed_attention: bool = True
     use_mae_aux: bool = True
     mae_mask_ratio: float = 0.5
     mae_heads: int = 2
@@ -383,7 +422,7 @@ class ExampleQuantizingAutoencoderWithRope(nn.Module):
             conf = HBQAutoencoderConfig(**conf)
         self.config = conf
 
-        self.backbone = ExampleAutoencoder(
+        self.backbone = ExampleAutoencoderWithRope(
             in_channels=conf.in_channels,
             base_dim=conf.base_dim,
             channel_multipliers=conf.channel_multipliers,
@@ -392,6 +431,8 @@ class ExampleQuantizingAutoencoderWithRope(nn.Module):
             use_attention=True,
             window_size=conf.window_size,
             bottleneck_heads=conf.bottleneck_heads,
+            bottleneck_layers=conf.bottleneck_layers,
+            use_intermediate_windowed_attention=conf.use_intermediate_windowed_attention,
         )
 
         if quantizer is not None:
@@ -415,7 +456,6 @@ class ExampleQuantizingAutoencoderWithRope(nn.Module):
                 conf.quant_dim,
                 depth=conf.mae_depth,
                 heads=conf.mae_heads,
-                window_size=conf.window_size,
                 mask_ratio=conf.mae_mask_ratio,
             )
             if conf.use_mae_aux else None
