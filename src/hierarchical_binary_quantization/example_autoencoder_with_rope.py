@@ -201,6 +201,16 @@ class RoPEAttentionBlock(nn.Module):
     Grid dims that don't divide evenly by window_size are reflect-padded
     before windowing and cropped back after -- so this works on odd shapes
     like 64x48, not just powers of two.
+
+    The residual branch is scaled by a learnable `gate`, initialized to zero
+    (LayerScale/ReZero-style). At step zero every block is a pure identity
+    pass-through, so training starts from the already-stable conv backbone's
+    behavior, with attention phasing in gradually as `gate` moves away from
+    zero -- rather than injecting a full-strength, untrained attention
+    transform into a deep stack from the very first step. NOTE: this adds one
+    new scalar parameter per block, so loading an OLDER checkpoint needs
+    `strict=False` -- the missing `gate` keys will fall back to their zero
+    init, which is exactly the intended starting point anyway.
     """
 
     def __init__(self, c, heads=8, window_size=None):
@@ -208,6 +218,7 @@ class RoPEAttentionBlock(nn.Module):
         self.norm = _gn(c)
         self.attn = RoPEMultiheadAttention(c, heads)
         self.window_size = window_size
+        self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: Tensor) -> Tensor:
         b, c, h, w = x.shape
@@ -218,7 +229,7 @@ class RoPEAttentionBlock(nn.Module):
             y = y.flatten(2).transpose(1, 2)          # (B, H*W, C)
             y = self.attn(y, h, w)
             y = y.transpose(1, 2).reshape(b, c, h, w)
-            return x + y
+            return x + self.gate * y
 
         pad_h = (ws - h % ws) % ws
         pad_w = (ws - w % ws) % ws
@@ -233,7 +244,7 @@ class RoPEAttentionBlock(nn.Module):
         y_pad = y_pad.reshape(b, c, hp, wp)
 
         y_out = y_pad[:, :, :h, :w]
-        return x + y_out
+        return x + self.gate * y_out
 
 
 # ---------------------------------------------------------------------------
@@ -305,13 +316,12 @@ class Decoder(_StagedTower):
 class AutoencoderResults:
     latents: Tensor
     quant_info: object = None
+    q_out: "Tensor | None" = None
     mae_pred: "Tensor | None" = None
     mae_target: "Tensor | None" = None
     mae_mask: "Tensor | None" = None
 
     def mae_loss(self):
-        """Mean squared error at masked positions only. Returns None if the
-        masked-token auxiliary task wasn't run (use_mae_aux=False)."""
         if self.mae_pred is None:
             return None
         mask = self.mae_mask.expand_as(self.mae_target)
@@ -477,6 +487,6 @@ class ExampleQuantizingAutoencoderWithRope(nn.Module):
         z_dec = self.post_quant(q_out)
         reconstructions = self.backbone.decode(z_dec)
         return reconstructions, AutoencoderResults(
-            latents=latents, quant_info=q_aux,
+            latents=latents, quant_info=q_aux, q_out=q_out,
             mae_pred=mae_pred, mae_target=mae_target, mae_mask=mae_mask,
         )
