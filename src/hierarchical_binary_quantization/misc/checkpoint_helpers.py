@@ -65,7 +65,7 @@ def load_checkpoint(model, optimizer, path, map_location=None, strict=True):
     print(f"    Model class: {checkpoint.get('model_class', '?')}")
     print(checkpoint["config"])
     model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
-    if optimizer and checkpoint["optimizer_state_dict"]:
+    if optimizer and checkpoint.get("optimizer_state_dict"):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         print(f"Warning, convert this legacy checkpoint at {path}")
     if os.path.exists(f"{path}.optimizer.pth") and optimizer is not None:

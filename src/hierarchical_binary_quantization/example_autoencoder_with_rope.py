@@ -7,13 +7,7 @@ set_grad_checkpointing. The conv towers (ResBlock, _StagedTower, _gn) are
 unchanged from the original -- they were never the problem. What's new lives
 entirely in the bottleneck:
 
-  - RoPEAttentionBlock: replaces the old position-blind nn.MultiheadAttention
-    block. Supports window_size=None (global, for long-range consistency like
-    matching a hat's color to boots) or window_size=k (local k x k windows,
-    for path-continuity like a sword's slope matching its neighbor). Both use
-    2D RoPE, so behavior is governed by RELATIVE token offsets -- this is what
-    should make the bottleneck robust across the multiple training resolutions
-    you've needed separate models for before.
+  - RoPEAttentionBlock: global RoPE attention over the whole bottleneck grid,
 
   - MaskedTokenPredictor: a self-supervised auxiliary task. Masks a fraction
     of the quantized tokens and tries to recover the pre-quantization latent
@@ -26,6 +20,7 @@ entirely in the bottleneck:
 """
 
 import torch
+import einx
 import torch.nn.functional as F
 from torch import nn, Tensor
 from dataclasses import dataclass
@@ -143,29 +138,39 @@ class _StagedTower(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RoPEMultiheadAttention(nn.Module):
-    def __init__(self, dim, heads=8):
+    def __init__(self, dim, heads=8, out_dim=None):
         super().__init__()
+        self.out_dim = out_dim if out_dim is not None else dim
         assert dim % heads == 0, f"dim={dim} not divisible by heads={heads}"
+        assert self.out_dim % heads == 0, f"out_dim={self.out_dim} not divisible by heads={heads}"
         self.heads = heads
         self.head_dim = dim // heads
+        self.out_head_dim = self.out_dim // heads
         assert self.head_dim % 4 == 0, (
             f"head_dim={self.head_dim} (dim={dim}/heads={heads}) must be "
             f"divisible by 4 for 2D RoPE -- pick a different head count"
         )
         self.rope = RoPE2D(self.head_dim)
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
+        # Always separate q/k/v projections -- simpler than branching on
+        # whether out_dim==dim, at the cost of not matching pre-refactor
+        # checkpoints (those need strict=False and a fresh attention start).
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, self.out_dim)
+        self.proj = nn.Linear(self.out_dim, self.out_dim)
 
     def forward(self, x: Tensor, h: int, w: int) -> Tensor:
-        # x: (B, N, C), N == h*w, tokens in row-major (y, x) order
-        b, n, c = x.shape
-        qkv = self.qkv(x).reshape(b, n, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, heads, N, head_dim)
+        # x: (B, N, C), N == h*w, tokens in row-major (y, x) order.
+        # Q/K always see the FULL input C (so attention decisions can use
+        # protected-channel content); V/output are restricted to out_dim.
+        q = einx.id("b n (heads d) -> b heads n d", self.q(x), heads=self.heads)
+        k = einx.id("b n (heads d) -> b heads n d", self.k(x), heads=self.heads)
+        v = einx.id("b n (heads d) -> b heads n d", self.v(x), heads=self.heads)
         cos, sin = self.rope.get_cos_sin(h, w, x.device, x.dtype)
         q = apply_rope2d(q, cos, sin)
         k = apply_rope2d(k, cos, sin)
         out = F.scaled_dot_product_attention(q, k, v)
-        out = out.transpose(1, 2).reshape(b, n, c)
+        out = einx.id("b heads n d -> b n (heads d)", out)
         return self.proj(out)
 
 
@@ -181,10 +186,11 @@ class BottleneckAttention(nn.Module):
     (A informs B informs C), not just one hop.
     """
 
-    def __init__(self, c, heads=8, num_layers=2):
+    def __init__(self, c, heads=8, num_layers=2, protected_channels=0):
         super().__init__()
         self.blocks = nn.Sequential(
-            *[RoPEAttentionBlock(c, heads=heads, window_size=None) for _ in range(num_layers)]
+            *[RoPEAttentionBlock(c, heads=heads, protected_channels=protected_channels)
+              for _ in range(num_layers)]
         )
 
     def forward(self, x):
@@ -192,59 +198,48 @@ class BottleneckAttention(nn.Module):
 
 
 class RoPEAttentionBlock(nn.Module):
-    """window_size=None: global attention over the whole H x W grid.
-    window_size=k:    non-overlapping k x k local windows, for local path/edge
-    continuity (e.g. a tapering sword's slope matching its neighbor) at a
-    higher-resolution stage, where full attention would be more expensive and
-    long-range binding isn't the point.
-
-    Grid dims that don't divide evenly by window_size are reflect-padded
-    before windowing and cropped back after -- so this works on odd shapes
-    like 64x48, not just powers of two.
+    """Global RoPE attention over the whole H x W grid.
 
     The residual branch is scaled by a learnable `gate`, initialized to zero
     (LayerScale/ReZero-style). At step zero every block is a pure identity
     pass-through, so training starts from the already-stable conv backbone's
     behavior, with attention phasing in gradually as `gate` moves away from
     zero -- rather than injecting a full-strength, untrained attention
-    transform into a deep stack from the very first step. NOTE: this adds one
-    new scalar parameter per block, so loading an OLDER checkpoint needs
-    `strict=False` -- the missing `gate` keys will fall back to their zero
-    init, which is exactly the intended starting point anyway.
+    transform into a deep stack from the very first step.
+
+    protected_channels: leading channels that are a hard identity bypass.
+    Attention forms Q/K from the FULL channel width (so it can still be
+    informed by protected content) but its WRITE only ever touches the
+    remaining (c - protected_channels) channels -- protected channels get an
+    exact zero contribution from this block, by construction, guaranteeing
+    global attention can never overwrite whatever lives there.
     """
 
-    def __init__(self, c, heads=8, window_size=None):
+    def __init__(self, c, heads=8, protected_channels=0):
         super().__init__()
+        assert 0 <= protected_channels < c
         self.norm = _gn(c)
-        self.attn = RoPEMultiheadAttention(c, heads)
-        self.window_size = window_size
+        self.protected_channels = protected_channels
+        write_dim = c - protected_channels
+        self.attn = RoPEMultiheadAttention(c, heads, out_dim=write_dim)
         self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: Tensor) -> Tensor:
         b, c, h, w = x.shape
         y = self.norm(x)
-        ws = self.window_size
+        pc = self.protected_channels
 
-        if ws is None:
-            y = y.flatten(2).transpose(1, 2)          # (B, H*W, C)
-            y = self.attn(y, h, w)
-            y = y.transpose(1, 2).reshape(b, c, h, w)
-            return x + self.gate * y
+        y_flat = einx.id("b c h w -> b (h w) c", y)          # full C for Q/K
+        y_flat = self.attn(y_flat, h, w)                      # (B, H*W, write_c)
+        write_c = c - pc
+        y_write = einx.id("b (h w) c -> b c h w", y_flat, h=h, w=w, c=write_c)
 
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        y_pad = F.pad(y, (0, pad_w, 0, pad_h), mode="reflect") if (pad_h or pad_w) else y
-        hp, wp = h + pad_h, w + pad_w
-        nh, nw = hp // ws, wp // ws
-
-        y_pad = y_pad.view(b, c, nh, ws, nw, ws).permute(0, 2, 4, 3, 5, 1)
-        y_pad = y_pad.reshape(b * nh * nw, ws * ws, c)
-        y_pad = self.attn(y_pad, ws, ws)
-        y_pad = y_pad.reshape(b, nh, nw, ws, ws, c).permute(0, 5, 1, 3, 2, 4)
-        y_pad = y_pad.reshape(b, c, hp, wp)
-
-        y_out = y_pad[:, :, :h, :w]
-        return x + self.gate * y_out
+        if pc > 0:
+            zeros = torch.zeros(b, pc, h, w, device=x.device, dtype=x.dtype)
+            y_full = torch.cat([zeros, y_write], dim=1)
+        else:
+            y_full = y_write
+        return x + self.gate * y_full
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +248,7 @@ class RoPEAttentionBlock(nn.Module):
 
 class Encoder(_StagedTower):
     def __init__(self, in_channels, dims, res_blocks, latent_dim, use_attention,
-                 window_size, bottleneck_heads, bottleneck_layers,
-                 use_intermediate_windowed_attention):
+                 bottleneck_heads, bottleneck_layers, protected_channel_fraction=0.0):
         stages = []
         stem = [nn.Conv2d(in_channels, dims[0], 3, padding=1, padding_mode="reflect"),
                 _gn(dims[0]), nn.SiLU(),
@@ -265,17 +259,13 @@ class Encoder(_StagedTower):
             down = [nn.Conv2d(dims[i], dims[i + 1], 4, stride=2, padding=1),
                     _gn(dims[i + 1]), nn.SiLU(),
                     *[ResBlock(dims[i + 1]) for _ in range(res_blocks[i + 1])]]
-            # one stage before the bottleneck: local windowed attention, where
-            # a sword/edge still spans multiple tokens and full attention
-            # would cost more than it needs to at this resolution.
-            if (use_attention and use_intermediate_windowed_attention
-                    and len(dims) >= 3 and i == len(dims) - 3):
-                down.append(RoPEAttentionBlock(dims[i + 1], bottleneck_heads, window_size))
             stages.append(down)
 
         latent_stage = []
         if use_attention:
-            latent_stage.append(BottleneckAttention(dims[-1], bottleneck_heads, bottleneck_layers))
+            pc = round(dims[-1] * protected_channel_fraction)
+            latent_stage.append(BottleneckAttention(dims[-1], bottleneck_heads, bottleneck_layers,
+                                                      protected_channels=pc))
         latent_stage.append(nn.Conv2d(dims[-1], latent_dim, 1))
         stages.append(latent_stage)
 
@@ -284,12 +274,13 @@ class Encoder(_StagedTower):
 
 class Decoder(_StagedTower):
     def __init__(self, in_channels, dims, res_blocks, latent_dim, use_attention,
-                 window_size, bottleneck_heads, bottleneck_layers,
-                 use_intermediate_windowed_attention):
+                 bottleneck_heads, bottleneck_layers, protected_channel_fraction=0.0):
         stages = []
         latent_stage = [nn.Conv2d(latent_dim, dims[-1], 1), _gn(dims[-1]), nn.SiLU()]
         if use_attention:
-            latent_stage.append(BottleneckAttention(dims[-1], bottleneck_heads, bottleneck_layers))
+            pc = round(dims[-1] * protected_channel_fraction)
+            latent_stage.append(BottleneckAttention(dims[-1], bottleneck_heads, bottleneck_layers,
+                                                      protected_channels=pc))
         stages.append(latent_stage)
 
         for i in range(len(dims) - 1, 0, -1):
@@ -297,11 +288,6 @@ class Decoder(_StagedTower):
                   nn.Upsample(scale_factor=2, mode="nearest"),
                   nn.Conv2d(dims[i], dims[i - 1], 3, padding=1, padding_mode="reflect"),
                   _gn(dims[i - 1]), nn.SiLU()]
-            # same channel width + resolution as the encoder's intermediate
-            # windowed block, so the two are genuinely symmetric.
-            if (use_attention and use_intermediate_windowed_attention
-                    and len(dims) >= 3 and i == len(dims) - 1):
-                up.append(RoPEAttentionBlock(dims[i - 1], bottleneck_heads, window_size))
             stages.append(up)
 
         tail = [*[ResBlock(dims[0]) for _ in range(res_blocks[0])],
@@ -329,7 +315,7 @@ class AutoencoderResults:
         return ((self.mae_pred - self.mae_target) ** 2 * mask).sum() / denom
 
 
-class ExampleAutoencoderWithRope(nn.Module):
+class ExampleAutoencoder(nn.Module):
     def __init__(
         self,
         in_channels=3,
@@ -338,21 +324,18 @@ class ExampleAutoencoderWithRope(nn.Module):
         latent_dim=32,
         res_blocks=(1, 2, 3, 3),
         use_attention=True,
-        window_size=4,
         bottleneck_heads=8,
         bottleneck_layers=2,
-        use_intermediate_windowed_attention=True,
+        protected_channel_fraction=0.0,
     ):
         super().__init__()
         dims = [base_dim * m for m in channel_multipliers]
         if isinstance(res_blocks, int):
             res_blocks = (res_blocks,) * len(dims)
         self.encoder = Encoder(in_channels, dims, res_blocks, latent_dim, use_attention,
-                                window_size, bottleneck_heads, bottleneck_layers,
-                                use_intermediate_windowed_attention)
+                                bottleneck_heads, bottleneck_layers, protected_channel_fraction)
         self.decoder = Decoder(in_channels, dims, res_blocks, latent_dim, use_attention,
-                                window_size, bottleneck_heads, bottleneck_layers,
-                                use_intermediate_windowed_attention)
+                                bottleneck_heads, bottleneck_layers, protected_channel_fraction)
 
     def set_grad_checkpointing(self, enable: bool = True):
         self.encoder.set_checkpointing(enable)
@@ -413,10 +396,9 @@ class HBQAutoencoderConfig:
     quant_dim: int = 8
     n_rounds: int = 4
     # new, all defaulted so existing call sites keep working unchanged
-    window_size: int = 4               # used only by the intermediate windowed stage now
     bottleneck_heads: int = 8
     bottleneck_layers: int = 2         # stacked global attention layers at the bottleneck
-    use_intermediate_windowed_attention: bool = True
+    protected_channel_fraction: float = 0.0   # 0.0 = old behavior, fully unaffected
     use_mae_aux: bool = True
     mae_mask_ratio: float = 0.5
     mae_heads: int = 2
@@ -432,17 +414,16 @@ class ExampleQuantizingAutoencoderWithRope(nn.Module):
             conf = HBQAutoencoderConfig(**conf)
         self.config = conf
 
-        self.backbone = ExampleAutoencoderWithRope(
+        self.backbone = ExampleAutoencoder(
             in_channels=conf.in_channels,
             base_dim=conf.base_dim,
             channel_multipliers=conf.channel_multipliers,
             latent_dim=conf.latent_dim,
             res_blocks=conf.res_blocks,
             use_attention=True,
-            window_size=conf.window_size,
             bottleneck_heads=conf.bottleneck_heads,
             bottleneck_layers=conf.bottleneck_layers,
-            use_intermediate_windowed_attention=conf.use_intermediate_windowed_attention,
+            protected_channel_fraction=conf.protected_channel_fraction,
         )
 
         if quantizer is not None:
