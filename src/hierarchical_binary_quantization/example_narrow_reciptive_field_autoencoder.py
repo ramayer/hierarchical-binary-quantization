@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from dataclasses import dataclass
 
-from .example_autoencoder_with_rope import (
+from nextgen_autoencoder import (
     RoPE2D, apply_rope2d, AutoencoderResults, MaskedTokenPredictor, _StagedTower,
 )
 
@@ -192,10 +192,17 @@ def receptive_field_pixels(cfg: "LocalAutoencoderConfig") -> int:
 class LocalAutoencoderConfig:
     in_channels: int = 3
     stem_dim: int = 64
-    stem_blocks: int = 2
-    patch_size: int = 16
+    stem_blocks: int = 1
+    patch_size: int = 8
     body_dim: int = 256
-    body: tuple = ("res", "attn", "res", "attn", "res", "attn", "res", "attn")
+    body: tuple = ("res", "attn")   # DEFAULT WAS NEVER CHECKED AGAINST
+                                     # receptive_field_pixels() before now -- the
+                                     # old 4-res/4-attn default had a 204px RADIUS
+                                     # (408px diameter), i.e. LARGER than a 256px
+                                     # image, i.e. not narrow at all. This default
+                                     # verified at 30px radius / 60px diameter --
+                                     # always re-check with receptive_field_pixels()
+                                     # before trusting any config you actually use.
     attn_block: int = 4        # neighborhood-attention query block size, in TOKENS
     attn_halo: int = 1         # neighborhood-attention halo, in TOKENS
     attn_heads: int = 4
