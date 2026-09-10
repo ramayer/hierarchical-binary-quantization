@@ -471,3 +471,12 @@ class ExampleQuantizingAutoencoderWithRope(nn.Module):
             latents=latents, quant_info=q_aux, q_out=q_out,
             mae_pred=mae_pred, mae_target=mae_target, mae_mask=mae_mask,
         )
+
+
+    @jaxtyped(typechecker=beartype)
+    def encode(self, images):
+        return self.backbone.encoder(images)
+
+    @jaxtyped(typechecker=beartype)
+    def decode(self, latents):
+        return self.backbone.decoder(latents)

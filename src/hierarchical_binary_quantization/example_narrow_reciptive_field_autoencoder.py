@@ -40,7 +40,7 @@ from torch import nn, Tensor
 from dataclasses import dataclass
 
 from .example_autoencoder_with_rope import (
-    RoPE2D, apply_rope2d, AutoencoderResults, MaskedTokenPredictor, _StagedTower,
+    RoPE2D, apply_rope2d, AutoencoderResults, _StagedTower,
 )
 
 
@@ -81,7 +81,18 @@ class ResBlockLocal(nn.Module):
 # ---------------------------------------------------------------------------
 
 class HaloedNeighborhoodAttention(nn.Module):
-    def __init__(self, dim, block=8, halo=4, heads=4):
+    def __init__(self, dim, block=8, halo=4, heads=4, rope_base=150):
+        # rope_base defaults to 150, not RoPE2D's usual 10000 -- 10000 is
+        # calibrated for long sequences (thousands of positions), but this
+        # window only ever spans a handful of tokens (block + 2*halo per
+        # side), so most of that frequency spectrum's slow-rotating channels
+        # barely move across the whole relevant offset range and carry almost
+        # no positional information. A much smaller base spreads the spectrum
+        # to actually be informative across a small window. Verified: at
+        # base=10000 with a 6-token window, the slowest channel pair rotates
+        # ~0.05 degrees across the entire relevant offset range; at base=150,
+        # ~2.6 degrees -- ~50x more signal. Re-tune this if block/halo change
+        # substantially, since the "right" base scales with window size.
         super().__init__()
         assert dim % heads == 0
         self.block = block
@@ -89,7 +100,7 @@ class HaloedNeighborhoodAttention(nn.Module):
         self.heads = heads
         self.head_dim = dim // heads
         assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
-        self.rope = RoPE2D(self.head_dim)
+        self.rope = RoPE2D(self.head_dim, base=rope_base)
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
@@ -146,14 +157,50 @@ class NeighborhoodAttentionBlock(nn.Module):
     """Same zero-init gate idiom as the main file's RoPEAttentionBlock: pure
     identity at step zero, phasing in as `gate` moves away from zero."""
 
-    def __init__(self, c, block=8, halo=4, heads=4):
+    def __init__(self, c, block=8, halo=4, heads=4, rope_base=150):
         super().__init__()
         self.norm = ChannelLayerNorm(c)
-        self.attn = HaloedNeighborhoodAttention(c, block=block, halo=halo, heads=heads)
+        self.attn = HaloedNeighborhoodAttention(c, block=block, halo=halo, heads=heads,
+                                                  rope_base=rope_base)
         self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         return x + self.gate * self.attn(self.norm(x))
+
+
+class LocalMaskedTokenPredictor(nn.Module):
+    """Same job as nextgen_autoencoder.MaskedTokenPredictor, but built on
+    NeighborhoodAttentionBlock (local, haloed) instead of BottleneckAttention
+    (global). This is a deliberate DIVERGENCE, not a shared component: a
+    global MAE predictor can reward the encoder for embedding broadcast-style
+    signals that only help a global consumer -- one that never exists in this
+    model's actual decode path, since it has no global attention either. That
+    reward would be pure waste: capacity spent serving a training-time-only
+    crutch, stolen from capacity that could encode the token's own patch. A
+    predictor built from the SAME local building block the rest of the model
+    uses can't create that incentive, because it never has the reach to
+    exploit it in the first place."""
+
+    def __init__(self, quant_dim, depth=2, heads=2, block=4, halo=1, rope_base=150,
+                 mask_ratio=0.5):
+        super().__init__()
+        self.mask_ratio = mask_ratio
+        self.mask_token = nn.Parameter(torch.zeros(1, quant_dim, 1, 1))
+        nn.init.normal_(self.mask_token, std=0.02)
+        self.blocks = nn.Sequential(*[
+            NeighborhoodAttentionBlock(quant_dim, block=block, halo=halo, heads=heads,
+                                        rope_base=rope_base)
+            for _ in range(depth)
+        ])
+        self.predict = nn.Conv2d(quant_dim, quant_dim, kernel_size=1)
+
+    def forward(self, q_out: Tensor, target: Tensor):
+        b, c, h, w = q_out.shape
+        mask = (torch.rand(b, 1, h, w, device=q_out.device) < self.mask_ratio).float()
+        x = q_out * (1 - mask) + self.mask_token * mask
+        x = self.blocks(x)
+        pred = self.predict(x)
+        return pred, target, mask
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +216,16 @@ def receptive_field_pixels(cfg: "LocalAutoencoderConfig") -> int:
       TOKEN space post-patchify, so its +1px (per conv) is +1 TOKEN, i.e.
       patch_size pixels, x2 per block
     - each NeighborhoodAttentionBlock: +halo TOKENS = halo*patch_size pixels
+    - pre_quant's own ResBlockLocal (token space, same as a body "res" layer):
+      +2 TOKENS = 2*patch_size pixels -- easy to forget since it's not part
+      of cfg.body, which is exactly what happened here once before
     This does NOT include the decoder's own receptive field (in latent-token
-    units) -- verify the full round trip empirically, not just this number.
+    units), including depatchify_overlap's own small one-time addition there
+    -- verify the full round trip empirically, not just this number.
     """
     px = cfg.patch_size / 2  # patchify's own footprint, one-time
     px += cfg.stem_blocks * 2 * 1  # 2 convs/block, 1px radius each, pre-patchify
-    token_radius = 0
+    token_radius = 2  # pre_quant's ResBlockLocal, always present
     for kind in cfg.body:
         if kind == "res":
             token_radius += 2 * 1  # 2 convs, 1 token radius each
@@ -192,17 +243,31 @@ def receptive_field_pixels(cfg: "LocalAutoencoderConfig") -> int:
 class LocalAutoencoderConfig:
     in_channels: int = 3
     stem_dim: int = 64
-    stem_blocks: int = 2
-    patch_size: int = 16
+    stem_blocks: int = 1
+    patch_size: int = 8
     body_dim: int = 256
-    body: tuple = ("res", "attn", "res", "attn", "res", "attn", "res", "attn")
+    body: tuple = ("res", "attn")   # DEFAULT WAS NEVER CHECKED AGAINST
+                                     # receptive_field_pixels() before now -- the
+                                     # old 4-res/4-attn default had a 204px RADIUS
+                                     # (408px diameter), i.e. LARGER than a 256px
+                                     # image, i.e. not narrow at all. This default
+                                     # verified at 30px radius / 60px diameter --
+                                     # always re-check with receptive_field_pixels()
+                                     # before trusting any config you actually use.
     attn_block: int = 4        # neighborhood-attention query block size, in TOKENS
     attn_halo: int = 1         # neighborhood-attention halo, in TOKENS
     attn_heads: int = 4
+    attn_rope_base: float = 150   # tuned for this window's small max offset -- see
+                                    # HaloedNeighborhoodAttention's docstring if you
+                                    # change attn_block/attn_halo substantially
     latent_dim: int = 32
     quant_dim: int = 8
     n_rounds: int = 4
     refine_blocks: int = 2     # post-de-patchify local cleanup at full resolution
+    depatchify_overlap: int = 0   # >0 blends `overlap` px across each patch boundary
+                                    # via a larger-than-stride transposed conv (overlap-add) --
+                                    # cheap, one-time RF addition at a single layer, meant to
+                                    # help blocky-at-quantization artifacts train away faster
     use_mae_aux: bool = True
     mae_mask_ratio: float = 0.5
     mae_heads: int = 2
@@ -216,7 +281,8 @@ def _body_stack(dim, cfg):
             layers.append(ResBlockLocal(dim))
         elif kind == "attn":
             layers.append(NeighborhoodAttentionBlock(
-                dim, block=cfg.attn_block, halo=cfg.attn_halo, heads=cfg.attn_heads))
+                dim, block=cfg.attn_block, halo=cfg.attn_halo, heads=cfg.attn_heads,
+                rope_base=cfg.attn_rope_base))
         else:
             raise ValueError(f"unknown body layer kind: {kind}")
     return layers
@@ -237,8 +303,9 @@ class LocalDecoder(_StagedTower):
     def __init__(self, cfg: LocalAutoencoderConfig):
         head = [nn.Conv2d(cfg.latent_dim, cfg.body_dim, 1)]
         body = _body_stack(cfg.body_dim, cfg)
-        depatchify = [nn.ConvTranspose2d(cfg.body_dim, cfg.stem_dim, cfg.patch_size,
-                                          stride=cfg.patch_size)]
+        depatchify = [nn.ConvTranspose2d(cfg.body_dim, cfg.stem_dim,
+                                          cfg.patch_size + 2 * cfg.depatchify_overlap,
+                                          stride=cfg.patch_size, padding=cfg.depatchify_overlap)]
         refine = [*[ResBlockLocal(cfg.stem_dim) for _ in range(cfg.refine_blocks)],
                   ChannelLayerNorm(cfg.stem_dim), nn.SiLU(),
                   nn.Conv2d(cfg.stem_dim, cfg.in_channels, 3, padding=1, padding_mode="reflect"),
@@ -267,13 +334,18 @@ class LocalQuantizingAutoencoder(nn.Module):
             self.quantizer = HBQQuantizer(n_rounds=cfg.n_rounds)
 
         self.pre_quant = nn.Sequential(
+            ResBlockLocal(cfg.latent_dim),
             nn.Conv2d(cfg.latent_dim, cfg.quant_dim, kernel_size=1), nn.Tanh(),
         )
-        self.post_quant = nn.Conv2d(cfg.quant_dim, cfg.latent_dim, kernel_size=1)
+        self.post_quant = nn.Sequential(
+            nn.Conv2d(cfg.quant_dim, cfg.latent_dim, kernel_size=1),
+            ResBlockLocal(cfg.latent_dim),
+        )
 
         self.mae = (
-            MaskedTokenPredictor(cfg.quant_dim, depth=cfg.mae_depth, heads=cfg.mae_heads,
-                                  mask_ratio=cfg.mae_mask_ratio)
+            LocalMaskedTokenPredictor(cfg.quant_dim, depth=cfg.mae_depth, heads=cfg.mae_heads,
+                                       block=cfg.attn_block, halo=cfg.attn_halo,
+                                       rope_base=cfg.attn_rope_base, mask_ratio=cfg.mae_mask_ratio)
             if cfg.use_mae_aux else None
         )
 

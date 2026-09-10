@@ -112,8 +112,8 @@ def show_model_info(model_edm):
         results.append(f"{mod:35} total: {tot:12,}   trainable: {train:12,}   trainable%: {pct:6.2f}")
     
     # Show largest individual parameter tensors for quick inspection
-    results.append("\nTop 10 largest parameter tensors:")
-    largest = sorted(model_edm.named_parameters(), key=lambda x: x[1].numel(), reverse=True)[:10]
+    results.append("\nTop 20 largest parameter tensors:")
+    largest = sorted(model_edm.named_parameters(), key=lambda x: x[1].numel(), reverse=True)[:20]
     for name, p in largest:
         results.append(f"{name:60} shape: {tuple(p.shape)} params: {p.numel():12,}  {'train' if p.requires_grad else 'frozen'}")
     return "\n".join(results)
