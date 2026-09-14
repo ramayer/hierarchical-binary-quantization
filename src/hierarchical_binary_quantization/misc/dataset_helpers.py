@@ -287,6 +287,10 @@ from torchvision import transforms as transforms
 
 
 class BlobDataset(Dataset):
+    """
+    Arbitray binary blob dataset.
+    Works as well on images as latent embedding space tensors.
+    """
     TABLE = "blobs"
 
     def __init__(self, filename, mode="r", where=None):
@@ -493,9 +497,9 @@ def make_w_h_dataset(src = '../../edm_diffusion_vibe_coding/data/fantasy',
 
 
 class PadToRectangle:
-    def __init__(self, target_width: int, target_height: int, background_color=0):
-        self.target_height = target_height
-        self.target_width = target_width
+    def __init__(self, width: int, height: int, background_color=(0,0,0)):
+        self.target_height = height
+        self.target_width = width
         self.background_color = background_color
 
     def __call__(self, img: Image.Image) -> Image.Image:
@@ -537,8 +541,83 @@ class ImageDataset(Dataset):
         return len(self.blob_ds)
 
     def __getitem__(self, idx):
-        id, data, md = self.blob_ds[idx]
+        id, data, metadata = self.blob_ds[idx]
         img = Image.open(io.BytesIO(data)).convert("RGB")
         if self.transform:
             img = self.transform(img)
-        return img
+        return id, img, metadata
+
+
+
+# For mapping between byte-based datasets and tesnor based datasets
+
+def tensor_to_bytes(t):
+    buffer = io.BytesIO()
+    torch.save(t.to('cpu'), buffer)
+    tensor_bytes = buffer.getvalue()
+    return tensor_bytes
+
+def bytes_to_tensor(tensor_bytes):
+    buffer = io.BytesIO(tensor_bytes)
+    restored_tensor = torch.load(buffer, weights_only=True, map_location='cpu')
+    return restored_tensor
+
+###############################################################################
+# Latent/embedding space datasets
+###############################################################################
+
+import torchvision as tv
+import einx
+from tqdm import tqdm
+
+def image_dataset_to_quantized_latent_dataset(
+        autoencoder, 
+        width,height,
+        dataset_name=None,
+        src_img_path=None,dst_latent_path=None,
+        device="cuda"
+    ):
+
+    src_img_path = src_img_path or f"data/dbs/{dataset_name}_{width}x{height}.sqlite3"
+    dst_latent_path = dst_latent_path or f"data/dbs/quantized_latents_for_{dataset_name}_{width}x{height}.sqlite3"
+
+    if os.path.exists(dst_latent_path):
+        print(f"Warning: {dst_latent_path} already existed. Skipping")
+        return None
+
+    transform = tv.transforms.Compose([
+        PadToRectangle(width=width,height=height,background_color=(255,255,255)),
+        tv.transforms.ToTensor(),
+        tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    img_blob_ds = BlobDataset(src_img_path, mode="r")
+    img_ds = ImageDataset(img_blob_ds, transform=transform)
+    with torch.inference_mode():
+        autoencoder.to(device)
+        with BlobDataset(dst_latent_path, "w") as derived:
+            for hash_, img_tensor, columns in tqdm(img_ds):
+                batch = einx.id("C H W -> 1 C H W", img_tensor)
+                raw_latents = autoencoder.encode(batch.to(device))
+                pre_quant_latents = autoencoder.pre_quant(raw_latents)
+                q_out, q_aux = autoencoder.quantizer(pre_quant_latents)
+                bit_codes = q_aux.bit_codes[0].to("cpu") # [C, H, W]
+                derived.write(
+                    hash_,
+                    tensor_to_bytes(bit_codes),
+                    columns,
+                )
+            derived.commit()
+    return dst_latent_path
+
+import hierarchical_binary_quantization.hbq as hbq
+
+class QuantizedLatentDataset(Dataset):
+    def __init__(self, blob_ds):
+        self.blob_ds = blob_ds
+    def __len__(self):
+        return len(self.blob_ds)
+    def __getitem__(self, idx):
+        id, data, metadata = self.blob_ds[idx]
+        bit_codes = bytes_to_tensor(data)
+        qlatents = hbq.bit_codes_to_quantized_latent(bit_codes,4)
+        return id, qlatents, metadata
