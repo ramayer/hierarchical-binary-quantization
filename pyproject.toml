@@ -32,4 +32,5 @@ dev = [
     "ipykernel",
     "mlflow>=3.16.0",
     "torchmetrics",
+    "cs336_basics @ git+https://github.com/ramayer/cs336-assignment1-basics.git"
 ]
