@@ -1,8 +1,3 @@
-# Scale to [-1, 1] (diffusion models usually expect this)
-def scale_to_minus_one_to_one(x):
-    return x * 2. - 1.
-LR=64
-HR=256
 # from torch.utils.data import Dataset
 # import torch.nn.functional as F
 # from torch.utils.data import DataLoader
@@ -13,6 +8,8 @@ HR=256
 # =========================
 
 from dataclasses import dataclass
+import io
+import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -21,6 +18,14 @@ from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as TF
 import matplotlib.pyplot as plt
 from torchvision.transforms.functional import to_pil_image
+from tqdm import tqdm
+
+
+# Scale to [-1, 1] (diffusion models usually expect this)
+def scale_to_minus_one_to_one(x):
+    return x * 2. - 1.
+LR=64
+HR=256
 
 
 # -------------------------
@@ -267,3 +272,352 @@ def show_transform_effect(loader,n_images=1, n_augs=4, seed=None):
             ax.set_title("aug")
             ax.axis("off")
             
+########################################################
+## Newer approach
+########################################################
+
+import hashlib
+import io
+import os
+import sqlite3
+from pathlib import Path
+from PIL import Image
+from torch.utils.data import Dataset
+from torchvision import transforms as transforms
+
+
+class BlobDataset(Dataset):
+    """
+    Arbitray binary blob dataset.
+    Works as well on images as latent embedding space tensors.
+    """
+    TABLE = "blobs"
+
+    def __init__(self, filename, mode="r", where=None):
+        self.filename = str(filename)
+        self.mode = mode
+        self.where = where
+
+        self.conn = None
+        self._pid = None
+        self._rowids = []
+        self._columns = None
+
+        if mode == "w":
+            self._connect()
+            if self.conn is None:
+                print("failed to connect")
+                return
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS blobs (
+                    hash INTEGER NOT NULL UNIQUE,
+                    path TEXT,
+                    data BLOB NOT NULL
+                )
+            """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_blobs_hash
+                ON blobs(hash)
+            """)
+            self.conn.commit()
+
+        elif mode == "r":
+            self._connect()
+            self._columns = self._get_columns()
+            self._rowids = self._query_rowids()
+
+        else:
+            raise ValueError("mode must be 'r' or 'w'")
+
+    def _connect(self):
+        pid = os.getpid()
+
+        if self.conn is None or self._pid != pid:
+            if self.conn is not None:
+                self.conn.close()
+
+            if self.mode == "r":
+                self.conn = sqlite3.connect(
+                    f"file:{self.filename}?mode=ro",
+                    uri=True,
+                )
+            else:
+                self.conn = sqlite3.connect(self.filename)
+
+            self._pid = pid
+
+        return self.conn
+
+    def _get_columns(self):
+        cursor = self._connect().execute(
+            f"SELECT * FROM {self.TABLE} LIMIT 0"
+        )
+        columns = [column[0] for column in cursor.description]
+
+        for required in ("hash", "data"):
+            if required not in columns:
+                raise ValueError(
+                    f"{self.TABLE} must contain '{required}' column"
+                )
+
+        return columns
+
+    def _query_rowids(self):
+        sql = f"SELECT rowid FROM {self.TABLE}"
+
+        if self.where:
+            sql += f" WHERE {self.where}"
+
+        return [row[0] for row in self._connect().execute(sql)]
+
+    def __len__(self):
+        return len(self._rowids)
+
+    def __getitem__(self, index):
+        rowid = self._rowids[index]
+
+        row = self._connect().execute(
+            f"SELECT * FROM {self.TABLE} WHERE rowid = ?",
+            (rowid,),
+        ).fetchone()
+
+        if row is None:
+            raise IndexError(index)
+
+        return self._make_result(row)
+
+    def __iter__(self):
+        conn = self._connect()
+
+        for rowid in self._rowids:
+            row = conn.execute(
+                f"SELECT * FROM {self.TABLE} WHERE rowid = ?",
+                (rowid,),
+            ).fetchone()
+
+            if row is not None:
+                yield self._make_result(row)
+
+    def _make_result(self, row):
+        values = dict(zip(self._columns, row)) # type:ignore
+        hash_ = values.pop("hash")
+        data = values.pop("data")
+
+        return hash_, data, values
+
+    def write(self, hash_, data, columns=None):
+        if self.mode != "w":
+            raise RuntimeError("dataset is not writable")
+
+        columns = columns or {}
+
+        names = ["hash", "data", *columns.keys()]
+        placeholders = ", ".join("?" for _ in names)
+
+        self._connect().execute(
+            f"""
+            INSERT INTO {self.TABLE} ({", ".join(names)})
+            VALUES ({placeholders})
+            ON CONFLICT(hash) DO NOTHING
+            """,
+            [hash_, data, *columns.values()],
+        )
+
+    def commit(self):
+        if self.mode != "w":
+            raise RuntimeError("dataset is not writable")
+
+        self._connect().commit()
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+            self._pid = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["conn"] = None
+        state["_pid"] = None
+        return state
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def hash_bytes(data):
+    i =  int.from_bytes(
+        hashlib.sha256(data).digest()[:8],
+        byteorder="big",
+        signed=False,
+    )
+    return i & 0x7fffffffffffffff
+
+
+def load_image_directory(dataset, directory, 
+                         transform=None, 
+                         pats = ('*.jpg','*.jpeg','*.webp','*.avif','*.gif')):
+    directory = Path(directory)
+    paths = []
+    for pat in pats:
+        paths.extend(directory.rglob(pat))
+    for path in tqdm(paths):
+        if not path.is_file():
+            continue
+        original = path.read_bytes()
+        hash_ = hash_bytes(original)
+        with Image.open(io.BytesIO(original)) as image:
+            if transform is not None:
+                image = transform(image)
+            buffer = io.BytesIO()
+            image.save(buffer, format="WEBP")
+        dataset.write(
+            hash_,
+            buffer.getvalue(),
+            {"path": str(path.relative_to(directory))},
+        )
+    dataset.commit()
+
+def make_w_h_dataset(src = '../../edm_diffusion_vibe_coding/data/fantasy',
+                     dst = 'tmp_new_ds.sqlite3',
+                     w = 384,
+                     h = 512,
+):
+    def resize_with_pil(img:Image.Image,w=w,h=h):
+        img.thumbnail(size=(w,h),resample=Image.Resampling.LANCZOS)
+        return img
+    transform = transforms.Compose([
+        resize_with_pil,
+    ])
+    with BlobDataset(dst, "w") as ds:
+        load_image_directory(ds, src, transform=transform)
+
+
+class PadToRectangle:
+    def __init__(self, width: int, height: int, background_color=(0,0,0)):
+        self.target_height = height
+        self.target_width = width
+        self.background_color = background_color
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        img_w, img_h = img.size
+        padded_img = Image.new(img.mode, (self.target_width, self.target_height), self.background_color)
+        paste_x = max(0, (self.target_width - img_w) // 2)
+        paste_y = max(0, (self.target_height - img_h) // 2)
+        padded_img.paste(img, (paste_x, paste_y))
+        return padded_img
+
+
+
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms as T
+
+class ImageDataset(Dataset):
+    """
+        Treat a blob dataset as an image dataset with arbitrary transforms
+
+        transform = transforms.Compose([
+            ih.PadToRectangle(384,512),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+
+        imgds = ImageDataset(bds, transform)
+        next(iter(imgds))
+        imgds[10]
+        from hierarchical_binary_quantization.misc.image_helpers import tensor_to_pil
+        tensor_to_pil(imgds[10])
+    """
+    def __init__(self, blob_ds, transform=None):
+        self.transform = transform
+        self.blob_ds = blob_ds
+
+    def __len__(self):
+        return len(self.blob_ds)
+
+    def __getitem__(self, idx):
+        id, data, metadata = self.blob_ds[idx]
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return id, img, metadata
+
+
+
+# For mapping between byte-based datasets and tesnor based datasets
+
+def tensor_to_bytes(t):
+    buffer = io.BytesIO()
+    torch.save(t.to('cpu'), buffer)
+    tensor_bytes = buffer.getvalue()
+    return tensor_bytes
+
+def bytes_to_tensor(tensor_bytes):
+    buffer = io.BytesIO(tensor_bytes)
+    restored_tensor = torch.load(buffer, weights_only=True, map_location='cpu')
+    return restored_tensor
+
+###############################################################################
+# Latent/embedding space datasets
+###############################################################################
+
+import torchvision as tv
+import einx
+from tqdm import tqdm
+
+def image_dataset_to_quantized_latent_dataset(
+        autoencoder, 
+        width,height,
+        dataset_name=None,
+        src_img_path=None,dst_latent_path=None,
+        device="cuda"
+    ):
+
+    src_img_path = src_img_path or f"data/dbs/{dataset_name}_{width}x{height}.sqlite3"
+    dst_latent_path = dst_latent_path or f"data/dbs/quantized_latents_for_{dataset_name}_{width}x{height}.sqlite3"
+
+    if os.path.exists(dst_latent_path):
+        print(f"Warning: {dst_latent_path} already existed. Skipping")
+        return None
+
+    transform = tv.transforms.Compose([
+        PadToRectangle(width=width,height=height,background_color=(255,255,255)),
+        tv.transforms.ToTensor(),
+        tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    img_blob_ds = BlobDataset(src_img_path, mode="r")
+    img_ds = ImageDataset(img_blob_ds, transform=transform)
+    with torch.inference_mode():
+        autoencoder.to(device)
+        with BlobDataset(dst_latent_path, "w") as derived:
+            for hash_, img_tensor, columns in tqdm(img_ds):
+                batch = einx.id("C H W -> 1 C H W", img_tensor)
+                raw_latents = autoencoder.encode(batch.to(device))
+                pre_quant_latents = autoencoder.pre_quant(raw_latents)
+                q_out, q_aux = autoencoder.quantizer(pre_quant_latents)
+                bit_codes = q_aux.bit_codes[0].to("cpu") # [C, H, W]
+                derived.write(
+                    hash_,
+                    tensor_to_bytes(bit_codes),
+                    columns,
+                )
+            derived.commit()
+    return dst_latent_path
+
+import hierarchical_binary_quantization.hbq as hbq
+
+class QuantizedLatentDataset(Dataset):
+    def __init__(self, blob_ds):
+        self.blob_ds = blob_ds
+    def __len__(self):
+        return len(self.blob_ds)
+    def __getitem__(self, idx):
+        id, data, metadata = self.blob_ds[idx]
+        bit_codes = bytes_to_tensor(data)
+        qlatents = hbq.bit_codes_to_quantized_latent(bit_codes,4)
+        return id, qlatents, metadata
