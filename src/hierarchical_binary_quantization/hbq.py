@@ -7,13 +7,13 @@ import einx
 import random
 import torch
 import torch.nn as nn
-from jaxtyping import Float, Int, jaxtyped
+from jaxtyping import Float, Int, jaxtyped, Int8
 from beartype import beartype
 from torch import Tensor
 from dataclasses import dataclass
 
 @jaxtyped(typechecker=beartype)
-def hbq(z: Float[Tensor,"*shape"], n_rounds:int) -> tuple[Float[Tensor,"*shape"],Int[Tensor,"*shape"]]:
+def hbq(z: Float[Tensor,"*shape"], n_rounds:int) -> tuple[Float[Tensor,"*shape"],Int8[Tensor,"*shape"]]:
     quantized = torch.zeros_like(z)
     bit_codes = torch.zeros(z.shape,dtype=torch.long,device=z.device)
     for r in range(n_rounds):
@@ -21,13 +21,17 @@ def hbq(z: Float[Tensor,"*shape"], n_rounds:int) -> tuple[Float[Tensor,"*shape"]
         high = z > quantized
         bit_codes = bit_codes * 2 + high.long()
         quantized = quantized + torch.where(high, interval, -interval)
+    if torch.any((bit_codes < -128) | (bit_codes > 127)):
+        print("Unexpected to have that many bits")
+    bit_codes = bit_codes.to(torch.int8)
     return quantized, bit_codes
 
 @jaxtyped(typechecker=beartype)
 def bit_codes_to_tokens(
-    bit_codes: Int[Tensor,"*B L"],
+    bit_codes: Int8[Tensor,"*B L"],
     n_rounds:int
 ) -> Int[Tensor,"*B"] | None:
+    bit_codes = bit_codes.to(torch.int64)
     latent_dim = bit_codes.shape[-1]
     total_bits = latent_dim * n_rounds
     if total_bits > 63:
@@ -49,7 +53,7 @@ def tokens_to_bit_codes(
     return result
 
 @jaxtyped(typechecker=beartype)
-def bit_codes_to_quantized_latent(bit_codes: Int[Tensor,"*B latent_dim"], n_rounds: int) -> Float[Tensor,"*B latent_dim"]:
+def bit_codes_to_quantized_latent(bit_codes: Int8[Tensor,"*B latent_dim"], n_rounds: int) -> Float[Tensor,"*B latent_dim"]:
     q = torch.zeros(bit_codes.shape,dtype=torch.float32, device=bit_codes.device)
     for r in range(n_rounds):
         interval = 0.5 ** (r+1)
@@ -60,7 +64,7 @@ def bit_codes_to_quantized_latent(bit_codes: Int[Tensor,"*B latent_dim"], n_roun
 @dataclass
 class QuantizerAuxOutputs:
     quantized: Float[Tensor, "*B L"]
-    bit_codes: Int[Tensor,"*B L"]
+    bit_codes: Int8[Tensor,"*B L"]
     tokens: Int[Tensor,"*B"]|None
     n_rounds: int
 
