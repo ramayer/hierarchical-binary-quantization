@@ -32,5 +32,10 @@ dev = [
     "ipykernel",
     "mlflow>=3.16.0",
     "torchmetrics",
-    "cs336_basics @ git+https://github.com/ramayer/cs336-assignment1-basics.git"
+    "cs336_basics @ git+https://github.com/ramayer/cs336-assignment1-basics.git",
+    "compressai",
+    "torchview>=0.2.7",
 ]
+
+[tool.uv.sources]
+compressai = { git = "https://github.com/InterDigitalInc/CompressAI.git" }
