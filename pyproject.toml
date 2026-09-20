@@ -35,6 +35,8 @@ dev = [
     "cs336_basics @ git+https://github.com/ramayer/cs336-assignment1-basics.git",
     "compressai",
     "torchview>=0.2.7",
+    "tqdm>=4.70.0",
+    "jupyterlab>=4.6.3",
 ]
 
 [tool.uv.sources]
