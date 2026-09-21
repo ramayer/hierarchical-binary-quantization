@@ -51,7 +51,7 @@ class MLFlowHelper:
     https://share.google/aimode/0xsbUN6W8CnyGRV9q
     """
 
-    def __init__(self, experiment_name, loggable_params, run_name=None):
+    def __init__(self, experiment_name, loggable_params, run_name=None, extra_params={}):
 
         try:
 
@@ -65,6 +65,8 @@ class MLFlowHelper:
             if is_dataclass(loggable_params):
                 loggable_params = asdict(loggable_params) # type:ignore
 
+            loggable_params = loggable_params | extra_params
+            
             if run_name is None:
                 with mlflow.start_run() as run:
                     self.run_name = run.info.run_name
