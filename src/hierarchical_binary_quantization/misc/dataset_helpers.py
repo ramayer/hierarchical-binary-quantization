@@ -10,6 +10,7 @@
 from dataclasses import dataclass
 import io
 import os
+import random
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -96,12 +97,22 @@ def skin_preserving_color_jitter(img: torch.Tensor, xform) -> torch.Tensor:
     cb = 0.564 * (b - y)
     cr = 0.713 * (r - y)
 
-    # Skin mask
-    skin = (
-        (cr > 0.05) & (cr < 0.25) &
-        (cb > -0.15) & (cb < 0.05) &
-        (y > 0.2)
+    # # Skin mask
+    # skin_color = (
+    #     (cr > 0.05) & (cr < 0.25) &
+    #     (cb > -0.15) & (cb < 0.05) &
+    #     (y > 0.2)
+    # )
+    # Expanded profile to capture shadows, varied lighting, and diverse skin tones
+    skin_color = (
+        (cr > 0.015) & (cr < 0.25) &
+        (cb > -0.22) & (cb < 0.05) &
+        (y > 0.10)
     )
+    saturation = torch.sqrt(cb**2 + cr**2)
+    # Rule out hyper-saturated fruit/objects
+    # (Adjust 0.28 down if fruit still leaks through, or up if it cuts real skin)
+    skin = skin_color & (saturation < 0.1)
 
     img02 = xform(img01)
     img = torch.where(skin, img01, img02)
@@ -566,6 +577,7 @@ def bytes_to_tensor(tensor_bytes):
 # Latent/embedding space datasets
 ###############################################################################
 
+deprecated="""
 import torchvision as tv
 import einx
 from tqdm import tqdm
@@ -621,3 +633,133 @@ class QuantizedLatentDataset(Dataset):
         bit_codes = bytes_to_tensor(data)
         qlatents = hbq.bit_codes_to_quantized_latent(bit_codes,4)
         return id, qlatents, metadata
+"""
+
+######################################
+# Newer, torchvision v2
+######################################
+import random
+import torchvision.transforms.v2 as v2
+import torch
+import math
+import random
+import torch
+import torchvision.transforms.v2 as T
+from torchvision.transforms.v2 import functional as F
+
+class ScalePadCrop(torch.nn.Module):
+    """
+    https://share.google/aimode/oUMIMpPxjnBhRMwm9
+    """
+    def __init__(
+        self,
+        width=128,
+        height=128,
+        *,
+        p_full_context=0.7,
+        cx_beta=(4, 4),
+        cy_beta=(2, 5),
+        random_pad=True,
+        fill=None,
+    ):
+        super().__init__()
+        self.width = width
+        self.height = height
+        self.p_full_context = p_full_context
+        self.cx_beta = cx_beta
+        self.cy_beta = cy_beta
+        self.random_pad = random_pad
+        self.fill = fill
+
+    @staticmethod
+    def _beta(beta):
+        return random.betavariate(*beta)
+
+    def forward(self, img):
+        orig_h, orig_w = F.get_size(img)
+
+        # ---------------------------------------------------------------------
+        # STEP 1: Determine Sizing Path
+        # ---------------------------------------------------------------------
+        # Calculate the exact scale factor needed to fit the image to the target box
+        max_fit_scale = min(self.width / orig_w, self.height / orig_h)
+
+        if max_fit_scale >= 1.0:
+            # The original image is already smaller than the target frame.
+            # Do not downscale or upscale; preserve native pixels.
+            scale = 1.0
+        elif random.random() < self.p_full_context:
+            # PATH A: Full-Context View
+            # Scale down just enough to fit perfectly (pads at most 2 sides)
+            scale = max_fit_scale
+        else:
+            # PATH B: Zoomed Crop View (Log-Uniform Sampling)
+            # This prevents oversampling extreme close-ups.
+            log_min = math.log(max_fit_scale)
+            log_max = math.log(1.0)  # which is 0.0
+            
+            # Sample uniformly in log-space, then exponentiate
+            scale = math.exp(random.uniform(log_min, log_max))
+
+        new_w = max(1, int(orig_w * scale))
+        new_h = max(1, int(orig_h * scale))
+        img = F.resize(img, (new_h, new_w), interpolation=T.InterpolationMode.BILINEAR)
+
+        # Update dimensions after resizing
+        h, w = F.get_size(img)
+
+        # ---------------------------------------------------------------------
+        # STEP 2: Intelligent Padding (Only hits if scale = 1.0 or Path A fits early)
+        # ---------------------------------------------------------------------
+        padw = max(self.width - w, 0)
+        padh = max(self.height - h, 0)
+
+        if padw or padh:
+            if self.random_pad:
+                padleft = random.randint(0, padw)
+                padtop = random.randint(0, padh)
+            else:
+                padleft = padw // 2
+                padtop = padh // 2
+
+            padright = padw - padleft
+            padbottom = padh - padtop
+
+            current_fill = (
+                img.mean(dim=(-2, -1)).tolist() 
+                if self.fill is None and isinstance(img, torch.Tensor)
+                else (self.fill if self.fill is not None else 0)
+            )
+
+            img = F.pad(img, [padleft, padtop, padright, padbottom], fill=current_fill)
+            h, w = F.get_size(img)
+
+        # ---------------------------------------------------------------------
+        # STEP 3: Beta-Biased Cropping (Extracts the window from zoomed images)
+        # ---------------------------------------------------------------------
+        min_cx = self.width / 2
+        max_cx = w - self.width / 2
+        min_cy = self.height / 2
+        max_cy = h - self.height / 2
+
+        cx = min_cx + self._beta(self.cx_beta) * (max_cx - min_cx) if max_cx > min_cx else min_cx
+        cy = min_cy + self._beta(self.cy_beta) * (max_cy - min_cy) if max_cy > min_cy else min_cy
+
+        left = round(cx - self.width / 2)
+        top = round(cy - self.height / 2)
+
+        return F.crop(img, top=top, left=left, height=self.height, width=self.width)
+
+
+class SkinPreservingColorJitter(torch.nn.Module):
+    def __init__(self, xform=None):
+        super().__init__()
+        self.xform = xform or v2.ColorJitter(
+            brightness=0.1,
+            hue=0.5
+        )
+
+    def forward(self,img):
+        return skin_preserving_color_jitter(img, self.xform)
+
+        
