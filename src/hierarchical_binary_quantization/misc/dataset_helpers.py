@@ -647,29 +647,34 @@ import torch
 import torchvision.transforms.v2 as T
 from torchvision.transforms.v2 import functional as F
 
+import math
+import random
+import torch
+import torchvision.transforms.v2 as T
+from torchvision.transforms.v2 import functional as F
+
 class ScalePadCrop(torch.nn.Module):
-    """
-    https://share.google/aimode/oUMIMpPxjnBhRMwm9
-    """
     def __init__(
         self,
-        width=128,
-        height=128,
+        width=384,
+        height=512,
         *,
         p_full_context=0.7,
         cx_beta=(4, 4),
         cy_beta=(2, 5),
         random_pad=True,
         fill=None,
+        deterministic=False,  # <-- Set True for structured data like Pokémon cards
     ):
         super().__init__()
         self.width = width
         self.height = height
-        self.p_full_context = p_full_context
+        self.p_full_context = p_full_context if not deterministic else 1.0
         self.cx_beta = cx_beta
         self.cy_beta = cy_beta
-        self.random_pad = random_pad
+        self.random_pad = random_pad if not deterministic else False
         self.fill = fill
+        self.deterministic = deterministic
 
     @staticmethod
     def _beta(beta):
@@ -679,37 +684,31 @@ class ScalePadCrop(torch.nn.Module):
         orig_h, orig_w = F.get_size(img)
 
         # ---------------------------------------------------------------------
-        # STEP 1: Determine Sizing Path
+        # STEP 1: Sizing Path
         # ---------------------------------------------------------------------
-        # Calculate the exact scale factor needed to fit the image to the target box
         max_fit_scale = min(self.width / orig_w, self.height / orig_h)
 
         if max_fit_scale >= 1.0:
-            # The original image is already smaller than the target frame.
-            # Do not downscale or upscale; preserve native pixels.
+            # Already fits inside target bounds: protect native resolution
             scale = 1.0
-        elif random.random() < self.p_full_context:
-            # PATH A: Full-Context View
-            # Scale down just enough to fit perfectly (pads at most 2 sides)
+        elif self.deterministic or (random.random() < self.p_full_context):
+            # PATH A: Full-Context View (Always taken if deterministic)
             scale = max_fit_scale
         else:
-            # PATH B: Zoomed Crop View (Log-Uniform Sampling)
-            # This prevents oversampling extreme close-ups.
+            # PATH B: Zoomed Crop View (Log-Uniform Distribution)
             log_min = math.log(max_fit_scale)
-            log_max = math.log(1.0)  # which is 0.0
-            
-            # Sample uniformly in log-space, then exponentiate
+            log_max = math.log(1.0)
             scale = math.exp(random.uniform(log_min, log_max))
 
         new_w = max(1, int(orig_w * scale))
-        new_h = max(1, int(orig_h * scale))
+        new_h = max(1, int(orig_w * scale) if orig_w == orig_h else int(orig_h * scale)) # Keep aspect ratio
         img = F.resize(img, (new_h, new_w), interpolation=T.InterpolationMode.BILINEAR)
 
         # Update dimensions after resizing
         h, w = F.get_size(img)
 
         # ---------------------------------------------------------------------
-        # STEP 2: Intelligent Padding (Only hits if scale = 1.0 or Path A fits early)
+        # STEP 2: Padding (Centered if deterministic)
         # ---------------------------------------------------------------------
         padw = max(self.width - w, 0)
         padh = max(self.height - h, 0)
@@ -719,6 +718,7 @@ class ScalePadCrop(torch.nn.Module):
                 padleft = random.randint(0, padw)
                 padtop = random.randint(0, padh)
             else:
+                # Evenly split padding to lock the image to the exact center
                 padleft = padw // 2
                 padtop = padh // 2
 
@@ -735,21 +735,25 @@ class ScalePadCrop(torch.nn.Module):
             h, w = F.get_size(img)
 
         # ---------------------------------------------------------------------
-        # STEP 3: Beta-Biased Cropping (Extracts the window from zoomed images)
+        # STEP 3: Cropping (Centered if deterministic)
         # ---------------------------------------------------------------------
         min_cx = self.width / 2
         max_cx = w - self.width / 2
         min_cy = self.height / 2
         max_cy = h - self.height / 2
 
-        cx = min_cx + self._beta(self.cx_beta) * (max_cx - min_cx) if max_cx > min_cx else min_cx
-        cy = min_cy + self._beta(self.cy_beta) * (max_cy - min_cy) if max_cy > min_cy else min_cy
+        if self.deterministic:
+            # Extract perfectly from the spatial dead-center
+            cx = min_cx + 0.5 * (max_cx - min_cx) if max_cx > min_cx else min_cx
+            cy = min_cy + 0.5 * (max_cy - min_cy) if max_cy > min_cy else min_cy
+        else:
+            cx = min_cx + self._beta(self.cx_beta) * (max_cx - min_cx) if max_cx > min_cx else min_cx
+            cy = min_cy + self._beta(self.cy_beta) * (max_cy - min_cy) if max_cy > min_cy else min_cy
 
         left = round(cx - self.width / 2)
         top = round(cy - self.height / 2)
 
         return F.crop(img, top=top, left=left, height=self.height, width=self.width)
-
 
 class SkinPreservingColorJitter(torch.nn.Module):
     def __init__(self, xform=None):
@@ -761,5 +765,70 @@ class SkinPreservingColorJitter(torch.nn.Module):
 
     def forward(self,img):
         return skin_preserving_color_jitter(img, self.xform)
+
+### Nice presets
+
+import hierarchical_binary_quantization.misc.image_helpers as ih
+import hierarchical_binary_quantization.misc.dataset_helpers as dh
+from torchvision.transforms import v2
+import random
+import torch
+
+
+def get_augmentation_preset(
+        width=384,  height=512,
+        augmentation_name = "basic"
+    ):
+    W,H = width,height
+    if augmentation_name == "basic":
+        return  v2.Compose([
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True), 
+            dh.ScalePadCrop(height=H,width=W, random_pad = False, deterministic=True, fill=(1,1,1)),
+            v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5),),
+        ])
+    if augmentation_name == "full_body_portrait":
+        # Emphasizes the top half of a body to emphasize facial features
+        return v2.Compose([
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True), 
+            dh.ScalePadCrop(height=H,width=W, cy_beta=(1,10), cx_beta=(6,6),p_full_context=0.5),
+            v2.RandomApply([dh.SkinPreservingColorJitter()], p=0.5),
+            v2.RandomHorizontalFlip(),
+            v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5),),
+        ])
+    if augmentation_name == "autoencoder_training":
+        if W < 384 or H < 384:
+            print("Warning, the autoencoder trains better with larger images zoomed to multiple scales")
+        return v2.Compose([
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True), 
+            dh.ScalePadCrop(height=H,width=W, cy_beta=(1,1), cx_beta=(2,2),p_full_context=0),
+            v2.RandomHorizontalFlip(),
+            v2.RandomVerticalFlip(),
+            v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5),),
+        ])
+    raise ValueError("unexpected augmentation name")
+
+def augmented_image_dataset(
+        dataset_name = "fantasy",
+        augmentation_name = "full_body_portrait",
+        width=384, height=512,
+        *,
+        base_path="data/dbs",
+        src_width=416, src_height=544,
+    ):
+    if src_width is None and src_height is None:
+        src_width,src_height = width,height
+    dbpath = f"{base_path}/{dataset_name}_{src_width}x{src_height}.sqlite3"
+    augmented_transform = get_augmentation_preset(
+        width=width,height=height,
+        augmentation_name=augmentation_name
+    )
+    bds = dh.BlobDataset(dbpath)
+    lds = dh.ImageDataset(bds, augmented_transform)
+    return lds
+
+
 
         
