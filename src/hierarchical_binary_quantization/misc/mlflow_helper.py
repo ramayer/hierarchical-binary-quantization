@@ -7,8 +7,6 @@ from dataclasses import asdict,is_dataclass
 # View with mlflow ui
 # ------------------------------------------------------------
 
-
-
 import mlflow
 from mlflow.tracking import MlflowClient
 

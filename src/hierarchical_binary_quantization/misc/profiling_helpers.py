@@ -2,7 +2,7 @@ import torch
 from torch.profiler import profile, ProfilerActivity
 
 def profile_net(net, name, batch_size=8, device="cuda"):
-    """Results like:
+    """For the examplep models in this repo, results like:
         Self CPU time total: 632.876ms
         Self CUDA time total: 631.603ms
       are healthy comparables to the top of our leaderboard.

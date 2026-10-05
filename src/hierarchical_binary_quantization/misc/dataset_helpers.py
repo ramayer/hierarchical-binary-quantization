@@ -10,6 +10,7 @@
 from dataclasses import dataclass
 import io
 import os
+import random
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -96,12 +97,22 @@ def skin_preserving_color_jitter(img: torch.Tensor, xform) -> torch.Tensor:
     cb = 0.564 * (b - y)
     cr = 0.713 * (r - y)
 
-    # Skin mask
-    skin = (
-        (cr > 0.05) & (cr < 0.25) &
-        (cb > -0.15) & (cb < 0.05) &
-        (y > 0.2)
+    # # Skin mask
+    # skin_color = (
+    #     (cr > 0.05) & (cr < 0.25) &
+    #     (cb > -0.15) & (cb < 0.05) &
+    #     (y > 0.2)
+    # )
+    # Expanded profile to capture shadows, varied lighting, and diverse skin tones
+    skin_color = (
+        (cr > 0.015) & (cr < 0.25) &
+        (cb > -0.22) & (cb < 0.05) &
+        (y > 0.10)
     )
+    saturation = torch.sqrt(cb**2 + cr**2)
+    # Rule out hyper-saturated fruit/objects
+    # (Adjust 0.28 down if fruit still leaks through, or up if it cuts real skin)
+    skin = skin_color & (saturation < 0.1)
 
     img02 = xform(img01)
     img = torch.where(skin, img01, img02)
@@ -566,6 +577,7 @@ def bytes_to_tensor(tensor_bytes):
 # Latent/embedding space datasets
 ###############################################################################
 
+deprecated="""
 import torchvision as tv
 import einx
 from tqdm import tqdm
@@ -621,3 +633,202 @@ class QuantizedLatentDataset(Dataset):
         bit_codes = bytes_to_tensor(data)
         qlatents = hbq.bit_codes_to_quantized_latent(bit_codes,4)
         return id, qlatents, metadata
+"""
+
+######################################
+# Newer, torchvision v2
+######################################
+import random
+import torchvision.transforms.v2 as v2
+import torch
+import math
+import random
+import torch
+import torchvision.transforms.v2 as T
+from torchvision.transforms.v2 import functional as F
+
+import math
+import random
+import torch
+import torchvision.transforms.v2 as T
+from torchvision.transforms.v2 import functional as F
+
+class ScalePadCrop(torch.nn.Module):
+    def __init__(
+        self,
+        width=384,
+        height=512,
+        *,
+        p_full_context=0.7,
+        cx_beta=(4, 4),
+        cy_beta=(2, 5),
+        random_pad=True,
+        fill=None,
+        deterministic=False,  # <-- Set True for structured data like Pokémon cards
+    ):
+        super().__init__()
+        self.width = width
+        self.height = height
+        self.p_full_context = p_full_context if not deterministic else 1.0
+        self.cx_beta = cx_beta
+        self.cy_beta = cy_beta
+        self.random_pad = random_pad if not deterministic else False
+        self.fill = fill
+        self.deterministic = deterministic
+
+    @staticmethod
+    def _beta(beta):
+        return random.betavariate(*beta)
+
+    def forward(self, img):
+        orig_h, orig_w = F.get_size(img)
+
+        # ---------------------------------------------------------------------
+        # STEP 1: Sizing Path
+        # ---------------------------------------------------------------------
+        max_fit_scale = min(self.width / orig_w, self.height / orig_h)
+
+        if max_fit_scale >= 1.0:
+            # Already fits inside target bounds: protect native resolution
+            scale = 1.0
+        elif self.deterministic or (random.random() < self.p_full_context):
+            # PATH A: Full-Context View (Always taken if deterministic)
+            scale = max_fit_scale
+        else:
+            # PATH B: Zoomed Crop View (Log-Uniform Distribution)
+            log_min = math.log(max_fit_scale)
+            log_max = math.log(1.0)
+            scale = math.exp(random.uniform(log_min, log_max))
+
+        new_w = max(1, int(orig_w * scale))
+        new_h = max(1, int(orig_w * scale) if orig_w == orig_h else int(orig_h * scale)) # Keep aspect ratio
+        img = F.resize(img, (new_h, new_w), interpolation=T.InterpolationMode.BILINEAR)
+
+        # Update dimensions after resizing
+        h, w = F.get_size(img)
+
+        # ---------------------------------------------------------------------
+        # STEP 2: Padding (Centered if deterministic)
+        # ---------------------------------------------------------------------
+        padw = max(self.width - w, 0)
+        padh = max(self.height - h, 0)
+
+        if padw or padh:
+            if self.random_pad:
+                padleft = random.randint(0, padw)
+                padtop = random.randint(0, padh)
+            else:
+                # Evenly split padding to lock the image to the exact center
+                padleft = padw // 2
+                padtop = padh // 2
+
+            padright = padw - padleft
+            padbottom = padh - padtop
+
+            current_fill = (
+                img.mean(dim=(-2, -1)).tolist() 
+                if self.fill is None and isinstance(img, torch.Tensor)
+                else (self.fill if self.fill is not None else 0)
+            )
+
+            img = F.pad(img, [padleft, padtop, padright, padbottom], fill=current_fill)
+            h, w = F.get_size(img)
+
+        # ---------------------------------------------------------------------
+        # STEP 3: Cropping (Centered if deterministic)
+        # ---------------------------------------------------------------------
+        min_cx = self.width / 2
+        max_cx = w - self.width / 2
+        min_cy = self.height / 2
+        max_cy = h - self.height / 2
+
+        if self.deterministic:
+            # Extract perfectly from the spatial dead-center
+            cx = min_cx + 0.5 * (max_cx - min_cx) if max_cx > min_cx else min_cx
+            cy = min_cy + 0.5 * (max_cy - min_cy) if max_cy > min_cy else min_cy
+        else:
+            cx = min_cx + self._beta(self.cx_beta) * (max_cx - min_cx) if max_cx > min_cx else min_cx
+            cy = min_cy + self._beta(self.cy_beta) * (max_cy - min_cy) if max_cy > min_cy else min_cy
+
+        left = round(cx - self.width / 2)
+        top = round(cy - self.height / 2)
+
+        return F.crop(img, top=top, left=left, height=self.height, width=self.width)
+
+class SkinPreservingColorJitter(torch.nn.Module):
+    def __init__(self, xform=None):
+        super().__init__()
+        self.xform = xform or v2.ColorJitter(
+            brightness=0.1,
+            hue=0.5
+        )
+
+    def forward(self,img):
+        return skin_preserving_color_jitter(img, self.xform)
+
+### Nice presets
+
+import hierarchical_binary_quantization.misc.image_helpers as ih
+import hierarchical_binary_quantization.misc.dataset_helpers as dh
+from torchvision.transforms import v2
+import random
+import torch
+
+
+def get_augmentation_preset(
+        width=384,  height=512,
+        augmentation_name = "basic"
+    ):
+    W,H = width,height
+    if augmentation_name == "basic":
+        return  v2.Compose([
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True), 
+            dh.ScalePadCrop(height=H,width=W, random_pad = False, deterministic=True, fill=(1,1,1)),
+            v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5),),
+        ])
+    if augmentation_name == "full_body_portrait":
+        # Emphasizes the top half of a body to emphasize facial features
+        return v2.Compose([
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True), 
+            dh.ScalePadCrop(height=H,width=W, cy_beta=(1,10), cx_beta=(6,6),p_full_context=0.5),
+            v2.RandomApply([dh.SkinPreservingColorJitter()], p=0.5),
+            v2.RandomHorizontalFlip(),
+            v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5),),
+        ])
+    if augmentation_name == "autoencoder_training":
+        if W < 384 or H < 384:
+            print("Warning, the autoencoder trains better with larger images zoomed to multiple scales")
+        return v2.Compose([
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True), 
+            dh.ScalePadCrop(height=H,width=W, cy_beta=(1,1), cx_beta=(2,2),p_full_context=0),
+            v2.RandomHorizontalFlip(),
+            v2.RandomVerticalFlip(),
+            v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5),),
+        ])
+    raise ValueError("unexpected augmentation name")
+
+def augmented_image_dataset(
+        dataset_name = "fantasy",
+        augmentation_name = "full_body_portrait",
+        width=384, height=512,
+        *,
+        base_path="data/dbs",
+        src_width=416, src_height=544,
+    ):
+    if src_width is None and src_height is None:
+        src_width,src_height = width,height
+    dbpath = f"{base_path}/{dataset_name}_{src_width}x{src_height}.sqlite3"
+    augmented_transform = get_augmentation_preset(
+        width=width,height=height,
+        augmentation_name=augmentation_name
+    )
+    bds = dh.BlobDataset(dbpath)
+    lds = dh.ImageDataset(bds, augmented_transform)
+    return lds
+
+
+
+        
