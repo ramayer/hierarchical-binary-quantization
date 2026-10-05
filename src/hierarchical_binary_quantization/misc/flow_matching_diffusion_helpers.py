@@ -33,11 +33,11 @@ def heun_step(net, z, t, t_next, t_eps):
 
 
 @torch.no_grad()
-def generate_simple(net, batch_size, latent_dim, grid_size, steps, t_eps,
+def generate_simple(net, batch_size, latent_dim, grid_height, grid_width, steps, t_eps,
              method="heun", noise_scale=1.0, device="cuda",
              save_steps=False):
     """ Generate an image from pure noise by taking multiple steps. """
-    z = noise_scale * torch.randn(batch_size, latent_dim, grid_size, grid_size, device=device)
+    z = noise_scale * torch.randn(batch_size, latent_dim, grid_height, grid_width, device=device)
     t_schedule = torch.linspace(0.0, 1.0, steps + 1, device=device)   # (steps+1,) plain values
     stepper = heun_step if method == "heun" else euler_step
     saved_steps=[]
@@ -200,4 +200,208 @@ def sample_t(n, P_mean=-0.8, P_std=0.8, device=None):
     z = torch.randn(n, device=device) * P_std + P_mean
     return torch.sigmoid(z)
 
-#===============================
+#######################################################################
+# Gemini recommended some differences in the generator
+#######################################################################
+
+
+
+import math
+import torch
+
+@torch.no_grad()
+def generate_using_sde(net, batch_size, latent_dim, grid_height, grid_width, steps, t_eps=0.05,
+                       noise_scale=1.0, device="cuda", S_churn=0.1, S_min=0.0, S_max=0.9, 
+                       save_steps=False):
+    """
+    Generate an image from pure noise by integrating a Stochastic Differential Equation (SDE)
+    constructed from a deterministic Flow Matching vector field.
+    
+    This function implements an explicit numerical solution to the reverse-time SDE 
+    using the classic Euler-Maruyama discretization scheme, combined with stochastic 
+    churn mechanics adapted from Karras et al. (Elucidating the Design Space of 
+    Diffusion-Based Generative Models, NeurIPS 2022).
+    
+    https://share.google/aimode/GQu5a6AvrHfCnCG3G
+    
+    Parameters:
+        net: The flow matching neural network, called as net(z, t).
+        batch_size (int): Number of parallel samples to generate.
+        latent_dim (int): Number of channels in the latent map.
+        grid_height/width (int): Spatial dimensions of the latent map.
+        steps (int): Total number of discrete integration intervals.
+        t_eps (float): Small safety clamping threshold to avoid singularities near t=1.
+        S_churn (float): Controls the total amount of stochasticity injected per step.
+                         Set to 0.0 to collapse the path back into a deterministic Euler ODE.
+        S_min / S_max (float): The active time interval [S_min, S_max] where stochastic noise
+                               injection is allowed. Excellent for preventing early structural
+                               chaos or late pixel-space clipping.
+    """
+    # 1. Initialize our trajectory at t=0 (Pure Gaussian Noise)
+    z = noise_scale * torch.randn(batch_size, latent_dim, grid_height, grid_width, device=device)
+    
+    # 2. Construct the time schedule. We step from t=0.0 (Noise) to t=1.0 (Clean Data)
+    t_schedule = torch.linspace(0.0, 1.0, steps + 1, device=device)
+    saved_steps = []
+    
+    for i in range(steps):
+        t_cur = t_schedule[i]
+        t_next = t_schedule[i + 1]
+        dt = t_next - t_cur
+        
+        # Determine if we should inject stochasticity at the current timestep
+        # Ref: Karras et al. (2022) algorithmic framework for stochastic churn
+        gamma = 0.0
+        if S_min <= t_cur.item() <= S_max:
+            # Scale gamma based on the step size to keep total variance invariant to step count
+            gamma = min(S_churn / steps, math.sqrt(2) - 1)
+            
+        if gamma > 0:
+            # Calculate an explicitly "inflated" temporary timestep
+            t_hat = t_cur + gamma * t_cur
+            
+            # Compute the proportional noise injection magnitude
+            # This maintains the exact variance schedule implied by our linear paths
+            sigma_fresh = math.sqrt(t_hat**2 - t_cur**2) * noise_scale
+            e_fresh = torch.randn_like(z)
+            
+            # Step 1 of Euler-Maruyama: Ancestral variance inflation
+            z = z + sigma_fresh * e_fresh
+            t_cur = t_hat
+            dt = t_next - t_cur
+            
+        # 3. Request our core Flow Matching velocity prediction
+        t_batch = torch.full((batch_size,), t_cur.item(), device=device)
+        x_pred = net(z, t_batch)
+        
+        # Convert the model's unreduced x_pred back into a trajectory velocity vector field
+        # v = (x - z) / (1 - t)
+        v_pred = (x_pred - z) / (1 - t_cur).clamp_min(t_eps)
+        
+        # Step 2 of Euler-Maruyama: Continuous path update
+        # z_{t+1} = z_t + dt * f(z_t, t) + (stochastic corrections embedded via dt)
+        z = z + dt * v_pred
+        
+        if save_steps:
+            saved_steps.append(x_pred.cpu().detach())
+            
+    return (z, saved_steps) if save_steps else z
+
+@torch.no_grad()
+def generate_using_stochastic_heun(net, batch_size, latent_dim, grid_height, grid_width, steps, t_eps=0.05,
+                                   noise_scale=1.0, device="cuda", S_churn=0.1, S_min=0.0, S_max=0.9, 
+                                   save_steps=False):
+    """
+    Generate an image from pure noise using a 2nd-Order Stochastic Heun Sampler.
+    
+    This function implements the official stochastic predictor-corrector framework 
+    detailed in 'Elucidating the Design Space of Diffusion-Based Generative Models' 
+    (Karras et al., NeurIPS 2022, Algorithm 2). 
+    
+    It injects stochastic noise at the beginning of each step interval, then uses 
+    Heun's 2nd-order method to accurately integrate across that specific noise state.
+    """
+    z = noise_scale * torch.randn(batch_size, latent_dim, grid_height, grid_width, device=device)
+    t_schedule = torch.linspace(0.0, 1.0, steps + 1, device=device)
+    saved_steps = []
+    
+    for i in range(steps):
+        t_cur = t_schedule[i]
+        t_next = t_schedule[i + 1]
+        
+        # --- 1. STOCHASTIC CHURN STEP ---
+        # Inject fresh noise to push the state onto a slightly noisier manifold position (t_hat)
+        gamma = 0.0
+        if S_min <= t_cur.item() <= S_max:
+            gamma = min(S_churn / steps, math.sqrt(2) - 1)
+            
+        t_hat = t_cur + gamma * t_cur
+        
+        if gamma > 0:
+            sigma_fresh = math.sqrt(t_hat**2 - t_cur**2) * noise_scale
+            e_fresh = torch.randn_like(z)
+            z = z + sigma_fresh * e_fresh
+            t_cur = t_hat # Update current time to our noise-inflated point
+            
+        dt = t_next - t_cur
+        
+        # --- 2. DETERMINISTIC HEUN PREDICTOR STEP ---
+        t_batch_cur = torch.full((batch_size,), t_cur.item(), device=device)
+        x_pred_cur = net(z, t_batch_cur)
+        v_cur = (x_pred_cur - z) / (1 - t_cur).clamp_min(t_eps)
+        
+        # Euler predictive step to find our intermediate state (z_prime)
+        z_prime = z + dt * v_cur
+        
+        if t_next >= 1.0:
+            # If we are hitting the final data step, collapse cleanly to Euler
+            z = z_prime
+            if save_steps:
+                saved_steps.append(x_pred_cur.cpu().detach())
+            continue
+            
+        # --- 3. DETERMINISTIC HEUN CORRECTOR STEP ---
+        t_batch_next = torch.full((batch_size,), t_next.item(), device=device)
+        x_pred_next = net(z_prime, t_batch_next)
+        v_next = (x_pred_next - z_prime) / (1 - t_next).clamp_min(t_eps)
+        
+        # 2nd-order trapezoidal integration using the average of both velocities
+        v_avg = 0.5 * (v_cur + v_next)
+        z = z + dt * v_avg
+        
+        if save_steps:
+            # Average the one-shot predictions for the logging step
+            saved_steps.append(((x_pred_cur + x_pred_next) / 2.0).cpu().detach())
+            
+    return (z, saved_steps) if save_steps else z
+
+###################################################################################
+
+#lds,ldl = get_latent_dataset_and_dataloader(dataset,shuffle=True, batch_size=1)
+
+def generate_using_direct_x_prediction(
+        lj,autoencoder,
+        x0 = torch.zeros(1,16,64,48),
+        t_schedule = torch.arange(0.0,1.0,0.1),
+        seed_noise_weight = 1,
+        churn_noise_weight = 0,
+        save_steps = False,
+        ):
+    """
+        No Euler or Heun required.
+        These models are trained for x-prediction,
+        so we can just repeatededly predict x.
+
+        Note that when trained on v-space MSE loss
+        this converges more slowly than the Euler 
+        and Heun samplers (that assume minimal curved
+        trajectories).
+
+        But when given a model trained on x-prediction
+        with a pixel-space loss function like lpips
+        this can converge faster(!)
+    """
+    device = next(lj.parameters()).device
+    x0 = x0.to(device)
+    x_pred = x0.clone()
+    #print("Original")
+    #decoded = autoencoder.decode(autoencoder.post_quant(x0))
+    #ipd.display(ih.tensor_to_pil(decoded[0]))
+    ew0 = seed_noise_weight
+    ew1 = churn_noise_weight
+    e0 = torch.randn_like(x0) 
+    saved_steps = []
+    for t_val in t_schedule:
+        e1 = torch.randn_like(x0)
+        e = (e0*ew0 + e1*ew1) / (ew0*ew0+ew1*ew1)**0.5
+        t = torch.full((x0.size(0),), t_val, device=device)
+        z = t.view(-1,1,1,1) * x_pred + (1 - t.view(-1,1,1,1)) * e
+        with torch.no_grad():
+            x_pred = lj(z, t)
+        saved_steps.append(z)
+        saved_steps.append(x_pred)
+        #noised = ih.tensor_to_pil(autoencoder.decode(autoencoder.post_quant(z))[0])
+        #denoised = ih.tensor_to_pil(autoencoder.decode(autoencoder.post_quant(x_pred))[0])
+        #print(t_val)
+        #ipd.display(ipd.HTML(ih.html_for_images([noised,denoised],f"time {t}")))
+    return (x_pred, saved_steps) if save_steps else x_pred
