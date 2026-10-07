@@ -289,7 +289,7 @@ def generate_using_sde(net, batch_size, latent_dim, grid_height, grid_width, ste
 
 @torch.no_grad()
 def generate_using_stochastic_heun(net, batch_size, latent_dim, grid_height, grid_width, steps, t_eps=0.05,
-                                   noise_scale=1.0, device="cuda", S_churn=0.1, S_min=0.0, S_max=0.9, 
+                                   noise_scale=1.0, device="cuda", S_churn=0.0, S_min=0.0, S_max=0.9, 
                                    save_steps=False):
     """
     Generate an image from pure noise using a 2nd-Order Stochastic Heun Sampler.
@@ -405,3 +405,62 @@ def generate_using_direct_x_prediction(
         #print(t_val)
         #ipd.display(ipd.HTML(ih.html_for_images([noised,denoised],f"time {t}")))
     return (x_pred, saved_steps) if save_steps else x_pred
+
+
+
+# Similar to the pixel-based diffusion models where we would modify an existing image.
+@torch.no_grad()
+def flow_matching_img2img(net, x_ref, steps=30, strength=0.6, method="heun", 
+                     t_eps=0.05, noise_scale=1.0, device="cuda", save_steps=False):
+    """
+    Performs image-to-image conditioning / style transfer using Flow Matching.
+    
+    Parameters:
+        net: The flow matching neural network.
+        x_ref (Tensor): The conditioning reference source (encoded latent or image).
+                        Shape must be (B, C, H, W).
+        steps (int): Total number of discrete steps for a full path.
+        strength (float): Transformation strength between 0.0 and 1.0.
+                          1.0 = Ignore x_ref, act as completely random generation.
+                          0.2 = Keep x_ref highly intact, only tweak fine details.
+        method (str): Vector integration method ("heun" or "euler").
+
+
+    Flow Conditioned Generation, first steps
+    https://share.google/aimode/yFzaCdSgBxrd3OT1K
+    """
+    x_ref = x_ref.to(device)
+    batch_size = x_ref.size(0)
+    
+    # 1. Calculate the starting boundary point based on strength
+    # For strength=0.6, we skip the first 60% of noisy trajectory and start at t = 0.4
+    t_start = 1.0 - strength
+    
+    # 2. Corrupt the reference image to the exact noise coordinate for t_start
+    e_target = torch.randn_like(x_ref) * noise_scale
+    
+    # Linear interpolation trajectory calculation matching flow foundations
+    z = t_start * x_ref + (1.0 - t_start) * e_target
+    
+    # 3. Build a truncated time schedule starting from t_start up to 1.0
+    # We allocate the user's total step budget exclusively to this remaining window
+    t_schedule = torch.linspace(t_start, 1.0, steps + 1, device=device)
+    
+    stepper = heun_step if method == "heun" else euler_step
+    saved_steps = []
+    
+    # 4. Integrate along the clean velocity vector fields
+    for i in range(steps - 1):
+        t_cur, t_next = t_schedule[i], t_schedule[i + 1]
+        z, x_pred = stepper(net, z, t_cur, t_next, t_eps)
+        
+        if save_steps:
+            saved_steps.append(x_pred.cpu().detach())
+            
+    # Final endpoint step outside the loop to cleanly hit t=1.0 without singular bounds
+    result, x_pred = euler_step(net, z, t_schedule[-2], t_schedule[-1], t_eps)
+    
+    if save_steps:
+        saved_steps.append(result.cpu().detach())
+        
+    return (result, saved_steps) if save_steps else result

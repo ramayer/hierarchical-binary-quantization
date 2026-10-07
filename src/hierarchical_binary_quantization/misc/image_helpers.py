@@ -1,11 +1,15 @@
 import base64
 import io
+import numpy as np
+import os
+import torch
+import torchvision.transforms as transforms
 from typing import List
 from PIL import Image, Image as PILImage
-import torch
 from torch import Tensor
-import torchvision.transforms as transforms
-import numpy as np
+from tqdm import tqdm
+from hierarchical_binary_quantization.misc.flow_matching_diffusion_helpers import generate_using_stochastic_heun
+
 # from warnings import deprecated # when we're on newer python
 
 def tensor_to_pil(img):
@@ -104,3 +108,194 @@ def rgb_to_ycbcr(x):
     cb = 0.5 + (-0.168736 * r - 0.331264 * g + 0.500000 * b)
     cr = 0.5 + ( 0.500000 * r - 0.418688 * g - 0.081312 * b)
     return torch.cat([y, cb, cr], dim=1)
+
+
+
+
+def generate_gallery(ldm,autoencoder,n=10000,
+                     output_dir="outputs/sample_images",seeds=None,
+                     grid_width=384//8,grid_height=512//8):
+    """Generate multiple images using the provided LDM and autoencoder, with keyboard controls to select images."""
+
+    html_headers = """
+        <style>
+
+            .i {
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+            background: #aaaaaa;
+            border: 3px solid #ccc;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin: 2px;
+            }
+
+            .i:hover {
+            border-color: #999;
+            }
+
+            .i:focus-visible {
+            outline: 1px solid #00ffff;
+            outline-offset: 2px;
+            }
+
+            .i[aria-pressed="true"] {
+            border-color: #ff7700;
+            box-shadow: 0 0 10px rgba(127, 255, 127, 0.3);
+            background: #ffff00;
+            }
+
+            .i img {
+            width: 100%;
+            height: auto;
+            border-radius: 4px;
+            }
+
+            .ic {
+                display:flex;
+                flex-wrap: wrap;
+            }
+            body {
+                background: #888888;
+            }
+            .caption {
+            margin-top: 8px;
+            font-size: 14px;
+            }
+
+            .i img {
+                max-width: 150px;
+                height: auto;
+            }
+
+            .preview-overlay {
+                display: none; /* Hidden by default */
+                position: fixed;
+                z-index: 9999;
+                /*width: 400px;  Adjust preview box width */
+                /*height: 300px; Adjust preview box height */
+                background: #000;
+                border: 4px solid #ff007f; /* Matching your neon theme */
+                box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+                pointer-events: none; /* Prevents the overlay from intercepting mouse events */
+            }
+
+            .preview-overlay img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+            }
+
+        </style>
+        <div id="image-preview-overlay" class="preview-overlay">
+        <img id="preview-img" src="" alt="Full size preview">
+        </div>
+        <div id="selected_images"></div>
+        <script>
+            function toggleSelection(buttonElement) {
+            const isPressed = buttonElement.getAttribute('aria-pressed') === 'true';
+            buttonElement.setAttribute('aria-pressed', !isPressed);
+            const itemId = buttonElement.getAttribute('data-id');
+            const isNowSelected = !isPressed;
+            onItemSelectionChange(itemId, isNowSelected);
+            }
+
+            function onItemSelectionChange(iid, isSelected) {
+                console.log(`Item ID: ${iid} | Selected: ${isSelected}`);
+                if (isSelected) {
+                    var selected = document.getElementById('selected_images');
+                    selected.innerHTML += ' ' + iid;
+                } else {
+                    var selected = document.getElementById('selected_images');
+                    selected.innerHTML = selected.innerHTML.replace(' ' + iid, '');
+                }
+            }
+
+            const previewOverlay = document.getElementById('image-preview-overlay');
+            const previewImg = document.getElementById('preview-img');
+
+            function showPreview(buttonElement) {
+                console.log('Preview shown');
+
+                // Grab the image source inside the hovered button
+                const imgSource = buttonElement.querySelector('img').src;
+                
+                // Update the preview image source (swap with a high-res URL if you have one)
+                previewImg.src = imgSource;
+                previewOverlay.style.display = 'block';
+                }
+
+                function movePreview(event) {
+                const mouseX = event.clientX;
+                const mouseY = event.clientY;
+                
+                // Get current viewport dimensions
+                const windowWidth = window.innerWidth;
+                const windowHeight = window.innerHeight;
+                
+                // Determine horizontal opposite
+                if (mouseX < windowWidth / 2) {
+                    // Mouse is on the LEFT -> Place preview on the RIGHT
+                    previewOverlay.style.left = 'auto';
+                    previewOverlay.style.right = '20px';
+                } else {
+                    // Mouse is on the RIGHT -> Place preview on the LEFT
+                    previewOverlay.style.right = 'auto';
+                    previewOverlay.style.left = '20px';
+                }
+                
+                // Determine vertical opposite
+                if (mouseY < windowHeight / 2) {
+                    // Mouse is on the TOP -> Place preview on the BOTTOM
+                    previewOverlay.style.top = 'auto';
+                    previewOverlay.style.bottom = '20px';
+                } else {
+                    // Mouse is on the BOTTOM -> Place preview on the TOP
+                    previewOverlay.style.bottom = 'auto';
+                    previewOverlay.style.top = '20px';
+                }
+            }
+
+            function hidePreview() {
+                previewOverlay.style.display = 'none';
+                previewImg.src = '';
+            }
+
+
+
+        </script>
+        """
+
+    with open(f"{output_dir}/index.html", "w") as f:
+        f.write(html_headers)
+        f.write("""
+        <div class='ic'>
+        """)
+
+    try:
+        if seeds is None:
+            seeds = list(range(n))
+        for seed in tqdm(seeds):
+            if not os.path.exists(f"{output_dir}/{seed}.webp"):
+                torch.manual_seed(seed)
+                l1 = generate_using_stochastic_heun(ldm,1,16,
+                                                    grid_width=grid_width,grid_height=grid_height,
+                                                    steps=25,t_eps=0.01,S_churn=0.05, noise_scale=0.95)
+
+                i1 = autoencoder.decode(autoencoder.post_quant(l1))
+                p1 = [tensor_to_pil(i) for i in i1]
+                p1[0].save(f"{output_dir}/{seed}.webp",quality=70)
+            with open(f"{output_dir}/index.html", "a") as f:
+                f.write(f"""
+                 <button class='i' onclick='toggleSelection(this)' data-id='{seed}'  onmouseenter='showPreview(this)' onmousemove='movePreview(event)' onmouseleave='hidePreview()' onfocus="showPreview(this)" >
+                 {seed}<br />
+                 <img src='{seed}.webp'/>
+                 </button>
+                 """)
+    except KeyboardInterrupt as e:
+        print("Generation interrupted by user.")
+    finally:
+        with open(f"{output_dir}/index.html", "a") as f:
+            f.write("</div>")
