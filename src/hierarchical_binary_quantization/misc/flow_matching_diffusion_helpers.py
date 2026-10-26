@@ -303,6 +303,7 @@ def generate_using_stochastic_heun(net, batch_size, latent_dim, grid_height, gri
     It injects stochastic noise at the beginning of each step interval, then uses 
     Heun's 2nd-order method to accurately integrate across that specific noise state.
     """
+    # generate on CPU for consistent noise
     z = noise_scale * torch.randn(batch_size, latent_dim, grid_height, grid_width, device=device)
     t_schedule = torch.linspace(0.0, 1.0, steps + 1, device=device)
     saved_steps = []
@@ -392,6 +393,7 @@ def generate_using_direct_x_prediction(
     ew0 = seed_noise_weight
     ew1 = churn_noise_weight
     e0 = torch.randn_like(x0) 
+    print(f"e0 shape: {e0.shape}, device: {e0.device}, dtype: {e0.dtype}, e0[0,0,0:2,0:2]: {e0[0,0,0:2,0:2]}")
     saved_steps = []
     for t_val in t_schedule:
         e1 = torch.randn_like(x0)

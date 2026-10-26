@@ -114,7 +114,8 @@ def rgb_to_ycbcr(x):
 
 def generate_gallery(ldm,autoencoder,n=10000,
                      output_dir="outputs/sample_images",seeds=None,
-                     grid_width=384//8,grid_height=512//8):
+                     grid_width=384//8,grid_height=512//8,
+                     noise_scale=0.95, S_churn=0.05):
     """Generate multiple images using the provided LDM and autoencoder, with keyboard controls to select images."""
 
     html_headers = """
@@ -273,7 +274,7 @@ def generate_gallery(ldm,autoencoder,n=10000,
         f.write("""
         <div class='ic'>
         """)
-
+    device = next(ldm.parameters()).device
     try:
         if seeds is None:
             seeds = list(range(n))
@@ -282,7 +283,8 @@ def generate_gallery(ldm,autoencoder,n=10000,
                 torch.manual_seed(seed)
                 l1 = generate_using_stochastic_heun(ldm,1,16,
                                                     grid_width=grid_width,grid_height=grid_height,
-                                                    steps=25,t_eps=0.01,S_churn=0.05, noise_scale=0.95)
+                                                    steps=25,t_eps=0.01,S_churn=S_churn, noise_scale=noise_scale,
+                                                    device=device)
 
                 i1 = autoencoder.decode(autoencoder.post_quant(l1))
                 p1 = [tensor_to_pil(i) for i in i1]
