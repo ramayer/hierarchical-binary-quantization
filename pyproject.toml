@@ -38,6 +38,7 @@ dev = [
     "tqdm>=4.70.0",
     "jupyterlab>=4.6.3",
     "mwclient>=0.11.0",
+    "pytorch-fid>=0.3.0",
 ]
 
 [tool.uv.sources]
