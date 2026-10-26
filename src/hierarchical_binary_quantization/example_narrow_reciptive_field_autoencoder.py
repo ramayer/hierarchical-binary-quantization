@@ -207,32 +207,27 @@ class LocalMaskedTokenPredictor(nn.Module):
 # Receptive field accounting -- the whole point of this variant
 # ---------------------------------------------------------------------------
 
-def receptive_field_pixels(cfg: "LocalAutoencoderConfig") -> int:
-    """Exact RF RADIUS in input pixels for one encoder pass, by construction:
-    - each stem ResBlockLocal conv (3x3, stride 1): +1 px radius per conv (x2 per block)
-    - patchify (kernel=stride=patch_size, non-overlapping): 0 additional radius
-      beyond the patch itself, so it contributes patch_size/2 as a one-time base
-    - each body ResBlockLocal: +1 patch-equivalent... actually operates in
-      TOKEN space post-patchify, so its +1px (per conv) is +1 TOKEN, i.e.
-      patch_size pixels, x2 per block
-    - each NeighborhoodAttentionBlock: +halo TOKENS = halo*patch_size pixels
-    - pre_quant's own ResBlockLocal (token space, same as a body "res" layer):
-      +2 TOKENS = 2*patch_size pixels -- easy to forget since it's not part
-      of cfg.body, which is exactly what happened here once before
-    This does NOT include the decoder's own receptive field (in latent-token
-    units), including depatchify_overlap's own small one-time addition there
-    -- verify the full round trip empirically, not just this number.
+def receptive_field_pixels(cfg) -> dict:
+    """Worst-case (structural-support) receptive field RADIUS in pixels.
+
+    Weight-independent upper bound: how far from a token centre (encoder) or an
+    output pixel (decoder) any input/latent can influence it. Safe for choosing
+    tile margins; trained effective RF is usually smaller.
+      encoder: pixels -> one latent token (radius from the token centre)
+      decoder: one latent token -> output pixels (radius from the output pixel)
+      total:   pixel -> pixel through encoder+decoder (~encoder + decoder)
     """
-    px = cfg.patch_size / 2  # patchify's own footprint, one-time
-    px += cfg.stem_blocks * 2 * 1  # 2 convs/block, 1px radius each, pre-patchify
-    token_radius = 2  # pre_quant's ResBlockLocal, always present
+    p = cfg.patch_size
+    hops = 2                                   # pre_quant (enc) / post_quant (dec) ResBlockLocal
     for kind in cfg.body:
-        if kind == "res":
-            token_radius += 2 * 1  # 2 convs, 1 token radius each
-        elif kind == "attn":
-            token_radius += cfg.attn_halo
-    px += token_radius * cfg.patch_size
-    return round(px)
+        hops += 2 if kind == "res" else (cfg.attn_block - 1 + cfg.attn_halo)
+    token_px = hops * p
+
+    stem_px = 1 + 2 * cfg.stem_blocks                      # ASSUMED: stem conv + res blocks (2 convs each)
+    enc = p / 2 + stem_px + token_px
+    tail_px = 2 + 2 * cfg.refine_blocks                    # ASSUMED: conv + refine res blocks + out conv
+    dec = token_px + p / 2 + cfg.depatchify_overlap + tail_px
+    return {"encoder": round(enc), "decoder": round(dec), "total": round(enc + dec)}
 
 
 # ---------------------------------------------------------------------------
