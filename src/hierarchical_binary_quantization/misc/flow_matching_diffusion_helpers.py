@@ -176,13 +176,15 @@ def losses_per_t_bin(values: torch.Tensor, t: torch.Tensor, num_bins: int=10) ->
     return LossBinStats(sums, counts)
 
 class BinnedLossAccumulator:
-    def __init__(self,num_bins, device="cpu", decay=0.9):
+    def __init__(self,num_bins, device="cpu", decay=0.98):
         self.decay = decay
         self.sums = torch.zeros(num_bins, device=device)
         self.counts = torch.zeros(num_bins, device=device)
+        self.total_counts = torch.zeros(num_bins, device=device)
     def update(self, stats:LossBinStats):
         self.sums = self.sums * self.decay + stats.sums.cpu()
         self.counts = self.counts * self.decay + stats.counts.float().cpu()
+        self.total_counts = self.total_counts + stats.counts.float().cpu()
     def means(self):
         return (self.sums / self.counts.clamp_min(1e-6)).cpu()
 
@@ -394,7 +396,7 @@ def generate_using_direct_x_prediction(
     for t_val in t_schedule:
         e1 = torch.randn_like(x0)
         e = (e0*ew0 + e1*ew1) / (ew0*ew0+ew1*ew1)**0.5
-        t = torch.full((x0.size(0),), t_val, device=device)
+        t = torch.full((x0.size(0),), t_val.item(), device=device)
         z = t.view(-1,1,1,1) * x_pred + (1 - t.view(-1,1,1,1)) * e
         with torch.no_grad():
             x_pred = lj(z, t)
@@ -464,3 +466,54 @@ def flow_matching_img2img(net, x_ref, steps=30, strength=0.6, method="heun",
         saved_steps.append(result.cpu().detach())
         
     return (result, saved_steps) if save_steps else result
+
+
+@torch.no_grad()
+def log_trajectory_straightness(net, autoencoder, dataloader, device, steps=[0.1, 0.5, 0.9]):
+    """
+    Logs the directional alignment of the velocity field along the trajectory.
+    Returns a score between -1.0 and 1.0 (closer to 1.0 means perfectly straight paths).
+
+    https://share.google/aimode/BIWwEqT8qL9gqLaBn
+    """
+    net.eval()
+    # Grab a standard batch of clean data
+    _, images, _ = next(iter(dataloader))
+    images = images.to(device)
+    
+    # 1. Encode images to your custom HBQ latent space
+    # x = autoencoder.encode(images) # Add your exact latent extraction here
+    x = images # (Using images directly if testing pixel-space flow)
+    
+    # Fix a single noise baseline for the whole test
+    e = torch.randn_like(x)
+    
+    velocities = []
+    for t_val in steps:
+        t_1d = torch.full((x.size(0),), t_val, device=device)
+        t_expanded = t_1d[(...,) + (None,) * (x.ndim - 1)]
+        
+        # Construct the sample at this exact timestep
+        z_t = t_expanded * x + (1 - t_expanded) * e
+        
+        # Predict x or v from the network
+        x_pred = net(z_t, t_1d)
+        
+        # Convert prediction back to velocity v vector: (x - z_t) / (1 - t)
+        dt = (1 - t_expanded).clamp_min(0.001)
+        v_pred = (x - z_t) / dt
+        
+        # Flatten velocity vectors for cosine similarity calculation
+        velocities.append(v_pred.flatten(1))
+        
+    # 2. Compute Cosine Similarity between early, mid, and late trajectory predictions
+    # Sim(Early, Mid)
+    cos_sim_early_mid = torch.nn.functional.cosine_similarity(velocities[0], velocities[1], dim=1).mean()
+    # Sim(Mid, Late)
+    cos_sim_mid_late = torch.nn.functional.cosine_similarity(velocities[1], velocities[2], dim=1).mean()
+    
+    # Average them out to get a total straightness score
+    total_straightness = (cos_sim_early_mid + cos_sim_mid_late).item() / 2.0
+    
+    print(f"--- Trajectory Straightness: {total_straightness:.4f} (Ideal: 1.0000) ---")
+    return total_straightness
