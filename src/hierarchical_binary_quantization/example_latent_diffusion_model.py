@@ -181,6 +181,7 @@ class AdaLNSpatialTransformerBlock(torch.nn.Module):
 
 ###########################################################################################
 # Minimal Spatial ViT Implementation
+from torch.utils.checkpoint import checkpoint
 
 class MinimalSpatialViT(torch.nn.Module):
     """
@@ -197,7 +198,8 @@ class MinimalSpatialViT(torch.nn.Module):
     on a similar losses eventually.
     """
     def __init__(self, latent_dim=8, d_model=384, num_heads=6,
-                 d_ff=1024, depth=6, theta=150.0):
+                 d_ff=1024, depth=6, theta=150.0,
+                 enable_checkpointing = False):
         super().__init__()
         self.latent_dim = latent_dim
         self.d_model = d_model
@@ -213,6 +215,8 @@ class MinimalSpatialViT(torch.nn.Module):
         #rows, cols = get_2d_positions(grid_size)
         #self.register_buffer("rows", rows)
         #self.register_buffer("cols", cols)
+        self.enable_checkpointing = enable_checkpointing
+        self.already_mentioned_checkpointing = False
         self.config = {
             "latent_dim":latent_dim,
             "d_model":d_model,
@@ -229,7 +233,17 @@ class MinimalSpatialViT(torch.nn.Module):
         tokens = self.x_embedder(tokens)             # (B, H*W, d_model)
         t_emb = timestep_embedding(t, self.d_model)   # (B, d_model)
         for block in self.blocks:
-            tokens = block(tokens, rows, cols, t_emb)
+            #tokens = block(tokens, rows, cols, t_emb)
+
+            nbytes = tokens.numel() * tokens.element_size()
+            if self.training and tokens.requires_grad and self.enable_checkpointing:
+                if not self.already_mentioned_checkpointing:
+                    print(f"checkpointing stages with bytes = {nbytes}")
+                    self.already_mentioned_checkpointing = True
+                tokens = checkpoint(block, tokens, rows, cols, t_emb, use_reentrant=False)
+            else:
+                tokens = block(tokens, rows, cols, t_emb)
+            
         tokens = self.final_linear(self.final_norm(tokens))
         return tokens.transpose(1, 2).reshape(B, C, H, W)
 
